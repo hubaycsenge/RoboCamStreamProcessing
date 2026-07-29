@@ -1,0 +1,91 @@
+"""The default processor: confirm the frame arrived and describe it.
+
+This is deliberately the whole job for now — it answers "is the image influx
+actually happening, and what shape is what I am receiving?" without any model
+weights involved.  It is also a useful permanent smoke test: point the robot at
+this processor to check the link before switching to a heavy model.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any, Dict, Optional
+
+import numpy as np
+
+from .base import Frame, Processor
+
+
+class StatsProcessor(Processor):
+    """Reports geometry, a rate estimate and a cheap content summary.
+
+    Options
+    -------
+    brightness:
+        Include mean/std of the image.  Costs a full pass over the pixels
+        (~1 ms for 720p), and is the quickest way to tell a live camera from a
+        lens cap or a frozen buffer.
+    checksum:
+        Include a cheap hash of the pixel data.  Useful for spotting a stream
+        that is re-sending one identical frame.
+    """
+
+    name = "stats"
+
+    def __init__(self, brightness: bool = True, checksum: bool = False, **options: Any) -> None:
+        super().__init__(brightness=brightness, checksum=checksum, **options)
+        self.brightness = bool(brightness)
+        self.checksum = bool(checksum)
+        self._count = 0
+        self._first_ts: Optional[float] = None
+        self._last_ts: Optional[float] = None
+        self._last_interval_ms = 0.0
+
+    def setup(self) -> None:
+        self._count = 0
+        self._first_ts = None
+        self._last_ts = None
+
+    def process(self, frame: Frame) -> Dict[str, Any]:
+        now = time.monotonic()
+        if self._first_ts is None:
+            self._first_ts = now
+        if self._last_ts is not None:
+            self._last_interval_ms = (now - self._last_ts) * 1000.0
+        self._last_ts = now
+        self._count += 1
+
+        img = frame.image
+        elapsed = now - self._first_ts
+
+        data: Dict[str, Any] = {
+            # The headline answer to "did a frame get through?".
+            "received": True,
+            "shape": list(img.shape),
+            "width": frame.width,
+            "height": frame.height,
+            "channels": frame.channels,
+            "dtype": str(img.dtype),
+            "nbytes": int(img.nbytes),
+            "payload_bytes": frame.payload_bytes,
+            # Compression ratio achieved on the wire; a sanity check on codec settings.
+            "compression_ratio": round(img.nbytes / frame.payload_bytes, 2) if frame.payload_bytes else 0.0,
+            "frames_seen": self._count,
+            "session_fps": round(self._count / elapsed, 2) if elapsed > 0.5 else 0.0,
+            "since_prev_ms": round(self._last_interval_ms, 2),
+        }
+
+        if self.brightness:
+            # Sample rather than reduce the whole array: a stride of 4 in each
+            # axis is 16x less work and tells you the same thing.
+            sample = img[::4, ::4]
+            data["mean"] = round(float(np.mean(sample)), 2)
+            data["std"] = round(float(np.std(sample)), 2)
+            # A dead camera gives a near-zero std; so does a lens cap.
+            data["looks_blank"] = bool(data["std"] < 1.0)
+
+        if self.checksum:
+            # Not cryptographic, just enough to notice a repeated frame.
+            data["checksum"] = format(int(np.sum(img[::8, ::8].astype(np.int64))) & 0xFFFFFFFF, "08x")
+
+        return data

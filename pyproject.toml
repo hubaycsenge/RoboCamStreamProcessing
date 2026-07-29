@@ -1,0 +1,29 @@
+[project]
+name = "robocam-stream-processing"
+version = "0.1.0"
+description = "Receive a robot's webcam stream, process it on the GPU server, reply with results"
+requires-python = ">=3.10"
+dependencies = [
+    "pyzmq>=25",
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+# H.264 ingest. Only needed if the robot streams with codec: h264.
+h264 = ["av>=11"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+robocam-server = "robocam.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["robocam*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,47 @@
+# RoboCam server configuration.
+#
+# Every key here has a default in robocam/config.py; an unknown key is a startup
+# error rather than a silent no-op.
+
+server:
+  # 0.0.0.0 so the robot on the university LAN can reach us.
+  # nipg36's LAN address is 10.128.17.196 — that is what the robot connects to.
+  bind: "tcp://0.0.0.0:5555"
+  io_poll_ms: 20
+  # Drop a session that has gone quiet for this long.
+  session_timeout_s: 20.0
+  max_payload_bytes: 33554432   # 32 MiB
+  rcvhwm: 64
+  sndhwm: 64
+
+queue:
+  # Frames buffered between the socket and the workers. Small on purpose: for a
+  # robot, a stale frame is worse than no frame. Raise this only if you start
+  # doing batched inference.
+  max_depth: 2
+  # "oldest" evicts the backlog and keeps latency low. "newest" refuses new
+  # arrivals and preserves ordering — use it if a model needs consecutive frames.
+  drop_policy: oldest
+
+processor:
+  # "stats"  -> report resolution/shape/rate, no models (current default)
+  # "noop"   -> reply immediately, measures the transport ceiling
+  # later: yolo, mast3r, vggt
+  name: stats
+  workers: 1
+  options:
+    brightness: true    # mean/std, catches a lens cap or a frozen buffer
+    checksum: false     # enable to detect an identical frame being resent
+
+snapshot:
+  # Periodically write a decoded frame to disk so you can confirm from your
+  # laptop, over the sshfs mount, that real images are arriving.
+  enabled: true
+  dir: snapshots
+  every_n_frames: 150
+  latest_only: true
+  jpeg_quality: 85
+
+logging:
+  level: INFO
+  stats_interval_s: 5.0
