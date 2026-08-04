@@ -75,8 +75,14 @@ class FusionProcessor(Processor):
         self._frames = 0
         self._frames_with_scan = 0
 
-    def configure(self, lidar_cfg: Any) -> None:
-        """Adopt the server's LiDAR geometry for anything not set explicitly."""
+    def configure(self, lidar_cfg: Any, imu_cfg: Any = None) -> None:
+        """Adopt the server's LiDAR geometry for anything not set explicitly.
+
+        The IMU config is not consulted: everything this processor says about
+        attitude comes from the summary the IO thread already computed with those
+        same thresholds, so re-deriving it here could only produce a second
+        answer to a question that already has one.
+        """
         if not self._explicit["hfov_deg"]:
             self.hfov_deg = float(lidar_cfg.camera_hfov_deg)
         if not self._explicit["mount_yaw_deg"]:
@@ -100,6 +106,8 @@ class FusionProcessor(Processor):
             data["mean"] = round(float(np.mean(sample)), 2)
             data["std"] = round(float(np.std(sample)), 2)
             data["looks_blank"] = bool(data["std"] < 1.0)
+
+        self._add_imu(frame, data)
 
         scan = frame.scan
         if scan is None:
@@ -144,6 +152,48 @@ class FusionProcessor(Processor):
             data["in_view_bins"] = 0
 
         return data
+
+    def _add_imu(self, frame: Frame, data: Dict[str, Any]) -> None:
+        """Attitude alongside the geometry, plus what it says about trusting it.
+
+        The IMU earns its place in a *fusion* processor by qualifying the other
+        two sensors rather than by adding a third picture of the scene:
+
+        * A tilted robot is a tilted scan plane.  The LDS-02 measures one
+          horizontal slice, and the whole projection here assumes that slice is
+          level; at 10° of pitch a return 3 m away is half a metre off the plane
+          the maths thinks it is in, which is the difference between a wall and
+          the floor in front of it.
+        * A turning robot smears a revolution.  The scanner takes ~200 ms to come
+          round, so at 60°/s the first and last points of one "scan" are taken
+          from headings a fifth of a turn apart.  ``scan_skew_deg`` is that
+          number, and it is the honest bound on how well any of these bearings
+          locate anything while the robot is rotating.
+        """
+        if frame.imu is None:
+            data["imu"] = None
+            data["imu_status"] = "no burst attached (no imu, disabled, or stale)"
+            return
+
+        summary = dict(frame.imu.summary)
+        data["imu"] = summary
+        data["imu_status"] = "ok"
+        data["imu_seq"] = frame.imu.seq
+        data["imu_age_ms"] = round(frame.imu_age_ms, 1)
+
+        tilt = summary.get("tilt_deg")
+        # Level enough that the plane assumption costs less than the parallax
+        # already ignored above; past it, say so rather than quietly degrading.
+        data["scan_plane_level"] = None if tilt is None else bool(tilt <= 5.0)
+
+        yaw_rate = summary.get("yaw_rate_dps")
+        scan_time = frame.scan.scan_time if frame.scan is not None else 0.0
+        if yaw_rate is not None and scan_time > 0:
+            data["scan_skew_deg"] = round(abs(yaw_rate) * scan_time, 1)
+        else:
+            # A scanner that does not report its revolution time gives no basis
+            # for this, and a guessed 5 Hz would make the number look measured.
+            data["scan_skew_deg"] = None
 
     # -- the seam a detector plugs into -----------------------------------
 

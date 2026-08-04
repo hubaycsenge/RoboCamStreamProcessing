@@ -8,14 +8,16 @@ ZeroMQ sockets are not thread-safe, so results travel from the workers to the
 IO thread through a plain ``queue.Queue`` which the IO loop drains after every
 poll.  That keeps all socket calls on one thread without any locking.
 
-LiDAR is the one exception to "the IO thread does nothing slow", and only
-because the work is genuinely tiny: parsing 360 uint16s and reducing them to
-sector minima is ~60 µs, against a 20 ms poll.  Scans are answered inline so
-that obstacle information is never stuck behind a model in the frame queue —
-at 5 Hz, queueing a scan behind two 30 ms frames would be most of its useful
-life.  The last scan is also held on the session and attached to the next frame,
-which is where camera/LiDAR fusion happens: association by arrival time on the
-server's own clock, rather than by two unrelated client clocks.
+The two non-camera sensors are the exception to "the IO thread does nothing
+slow", and only because the work is genuinely tiny: parsing 360 uint16s and
+reducing them to sector minima is ~60 µs against a 20 ms poll, and an inertial
+burst is a handful of numpy passes over a few dozen rows.  Both are answered
+inline so that obstacle and attitude information is never stuck behind a model
+in the frame queue — at 5 Hz, queueing a scan behind two 30 ms frames would be
+most of its useful life.  The last scan and the last burst are also held on the
+session and attached to the next frame, which is where fusion happens:
+association by arrival time on the server's own clock, rather than by unrelated
+client clocks.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import zmq
 
+from . import imu as imu_mod
 from . import lidar as lidar_mod
 from . import processors, wire
 from .config import Config
@@ -93,6 +96,16 @@ class Session:
     # ranges, so it is worth carrying.
     scan_interval_ms: float = 0.0
 
+    # -- IMU --------------------------------------------------------------
+    # What the client declared in its hello, if anything.
+    imu_info: Dict[str, Any] = field(default_factory=dict)
+    imu_bursts_received: int = 0
+    imu_samples_received: int = 0
+    imu_failed: int = 0
+    # Latest good burst, kept for attaching to frames.  One slot, latest wins.
+    last_imu: Optional[imu_mod.ImuBatch] = None
+    last_imu_ns: int = 0
+
     def touch(self) -> None:
         self.last_seen_ns = wire.monotonic_ns()
 
@@ -107,6 +120,15 @@ class Session:
         if stale_after_ms > 0 and age_ms > stale_after_ms:
             return None, age_ms
         return self.last_scan, age_ms
+
+    def fresh_imu(self, stale_after_ms: float) -> Tuple[Optional[imu_mod.ImuBatch], float]:
+        """The last burst and its age, or (None, 0) if there is none or it is stale."""
+        if self.last_imu is None:
+            return None, 0.0
+        age_ms = (wire.monotonic_ns() - self.last_imu_ns) / 1e6
+        if stale_after_ms > 0 and age_ms > stale_after_ms:
+            return None, age_ms
+        return self.last_imu, age_ms
 
     def age_s(self) -> float:
         return (wire.monotonic_ns() - self.created_ns) / 1e9
@@ -139,6 +161,7 @@ class StreamServer:
             hfov_deg=config.lidar.camera_hfov_deg,
             mount_yaw_deg=config.lidar.mount_yaw_deg,
             fov_bins=config.lidar.fov_bins,
+            imu_overlay=config.snapshot.imu_overlay and config.imu.enabled,
         )
 
         self._stop = threading.Event()
@@ -151,6 +174,9 @@ class StreamServer:
         self._stat_latency_ms = 0.0
         self._stat_scans = 0
         self._stat_scan_bytes = 0
+        self._stat_imu_bursts = 0
+        self._stat_imu_samples = 0
+        self._stat_imu_bytes = 0
 
     # -- lifecycle --------------------------------------------------------
 
@@ -173,9 +199,9 @@ class StreamServer:
 
         def build_processor():
             # Each worker gets its own instance; each is told where the scanner
-            # points before it sees a frame.
+            # points and how the IMU is read before it sees a frame.
             processor = processors.build(name, options)
-            processor.configure(self.cfg.lidar)
+            processor.configure(self.cfg.lidar, self.cfg.imu)
             return processor
 
         self.pool = WorkerPool(
@@ -189,7 +215,8 @@ class StreamServer:
         self.pool.start()
 
         log.info(
-            "listening on %s | processor=%s workers=%d | queue depth=%d drop=%s | lidar=%s",
+            "listening on %s | processor=%s workers=%d | queue depth=%d drop=%s | "
+            "lidar=%s | imu=%s",
             self.cfg.server.bind,
             name,
             self.cfg.processor.workers,
@@ -200,6 +227,11 @@ class StreamServer:
                 f"hfov {self.cfg.lidar.camera_hfov_deg:.0f}°, "
                 f"stale >{self.cfg.lidar.stale_after_ms:.0f} ms)"
                 if self.cfg.lidar.enabled else "off"
+            ),
+            (
+                f"on (tilt warn {self.cfg.imu.tilt_warn_deg:.0f}°, "
+                f"stale >{self.cfg.imu.stale_after_ms:.0f} ms)"
+                if self.cfg.imu.enabled else "off"
             ),
         )
         for addr in _local_addresses():
@@ -299,6 +331,8 @@ class StreamServer:
             self._on_frame(session, header, payload, recv_ts_ns)
         elif msg_type == wire.MSG_SCAN:
             self._on_scan(session, header, payload, recv_ts_ns)
+        elif msg_type == wire.MSG_IMU:
+            self._on_imu(session, header, payload, recv_ts_ns)
         elif msg_type == wire.MSG_PING:
             self._send(identity, wire.pong(header.get("nonce", 0), header.get("t_send_ns")))
         elif msg_type == wire.MSG_BYE:
@@ -347,7 +381,8 @@ class StreamServer:
             return
 
         log.info(
-            "session %s connected | client=%s camera=%s codec=%s %dx%d @%.1f fps | lidar=%s",
+            "session %s connected | client=%s camera=%s codec=%s %dx%d @%.1f fps | "
+            "lidar=%s | imu=%s",
             session.session_id,
             session.client_id,
             session.camera or "-",
@@ -356,6 +391,7 @@ class StreamServer:
             session.declared_height,
             session.declared_fps,
             _describe_lidar(session.lidar_info),
+            _describe_imu(session.imu_info),
         )
         self._send(
             identity,
@@ -379,6 +415,14 @@ class StreamServer:
                         "camera_hfov_deg": self.cfg.lidar.camera_hfov_deg,
                         "stale_after_ms": self.cfg.lidar.stale_after_ms,
                     },
+                    # Same bargain for the OpenCR: the robot is told what the
+                    # server will do with bursts before it opens the board.
+                    "imu": {
+                        "enabled": self.cfg.imu.enabled,
+                        "encodings": list(wire.SUPPORTED_IMU_ENCODINGS),
+                        "fields": list(wire.IMU_FIELDS),
+                        "stale_after_ms": self.cfg.imu.stale_after_ms,
+                    },
                 },
                 echo_t_send_ns=header.get("t_send_ns"),
             ),
@@ -398,6 +442,7 @@ class StreamServer:
             declared_fps=float(header.get("fps", 0) or 0),
             camera=str(header.get("camera", "")),
             lidar_info=dict(header.get("lidar") or {}),
+            imu_info=dict(header.get("imu") or {}),
         )
         self.sessions[identity] = session
         return session
@@ -408,13 +453,15 @@ class StreamServer:
             session.decoder.close()
             log.info(
                 "session %s closed | %d frames, %d dropped, %d failed, "
-                "%d scans (%d bad), %.1f MB, %.0fs",
+                "%d scans (%d bad), %d imu samples (%d bad bursts), %.1f MB, %.0fs",
                 session.session_id,
                 session.frames_received,
                 session.frames_dropped,
                 session.frames_failed,
                 session.scans_received,
                 session.scans_failed,
+                session.imu_samples_received,
+                session.imu_failed,
                 session.bytes_received / 1e6,
                 session.age_s(),
             )
@@ -463,9 +510,14 @@ class StreamServer:
         # travel independently, and at 5 Hz the scan's own age dominates
         # anything the transport adds.
         scan, scan_age_ms = session.fresh_scan(self.cfg.lidar.stale_after_ms)
+        # Same association, much tighter window: inertial data describes the
+        # instant it was taken, and a 200 ms old attitude belongs to a robot
+        # that may already have finished the turn.
+        burst, imu_age_ms = session.fresh_imu(self.cfg.imu.stale_after_ms)
 
         self._frame_counter += 1
-        self.snapshots.maybe_offer(session.session_id, seq, image, self._frame_counter, scan=scan)
+        self.snapshots.maybe_offer(session.session_id, seq, image, self._frame_counter,
+                                   scan=scan, imu=burst)
 
         frame = Frame(
             seq=seq,
@@ -477,6 +529,8 @@ class StreamServer:
             payload_bytes=len(payload),
             scan=scan,
             scan_age_ms=scan_age_ms if scan is not None else 0.0,
+            imu=burst,
+            imu_age_ms=imu_age_ms if burst is not None else 0.0,
         )
         for evicted in self.frames.put(frame):
             session.frames_dropped += 1
@@ -560,6 +614,81 @@ class StreamServer:
             t_send_ns=header.get("t_send_ns"),
         ))
 
+    # -- IMU path ---------------------------------------------------------
+
+    def _on_imu(self, session: Session, header: Dict[str, Any], payload: bytes, recv_ts_ns: int) -> None:
+        """Parse, analyse and answer one burst of inertial samples.
+
+        Every burst gets exactly one reply, for the same reason every frame and
+        every scan does: the client sizes its in-flight window from outstanding
+        replies, so a silently dropped burst would stall the IMU stream alone.
+        """
+        seq = int(header.get("seq", -1))
+        cfg = self.cfg.imu
+
+        if not cfg.enabled:
+            self._send(session.identity, wire.imu_result(
+                seq=seq, ok=False, reason=wire.REASON_IMU_DISABLED,
+                payload_bytes=len(payload),
+                encoding=str(header.get("encoding", "")),
+                server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+                data={"error": "server has imu.enabled: false"},
+                t_capture_ns=header.get("t_capture_ns"),
+                t_send_ns=header.get("t_send_ns"),
+            ))
+            return
+
+        session.imu_bursts_received += 1
+        session.bytes_received += len(payload)
+        self._stat_imu_bursts += 1
+        self._stat_imu_bytes += len(payload)
+
+        t0 = time.perf_counter()
+        try:
+            batch = imu_mod.decode_imu(header, payload, recv_ts_ns=recv_ts_ns)
+        except imu_mod.ImuError as exc:
+            session.imu_failed += 1
+            log.warning("session %s: imu seq=%d rejected: %s", session.session_id, seq, exc)
+            self._send(session.identity, wire.imu_result(
+                seq=seq, ok=False, reason=wire.REASON_BAD_IMU,
+                payload_bytes=len(payload),
+                encoding=str(header.get("encoding", "")),
+                parse_ms=(time.perf_counter() - t0) * 1000.0,
+                server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+                data={"error": str(exc)},
+                t_capture_ns=header.get("t_capture_ns"),
+                t_send_ns=header.get("t_send_ns"),
+            ))
+            return
+
+        session.imu_samples_received += batch.count
+        self._stat_imu_samples += batch.count
+
+        batch.summary = imu_mod.analyse(
+            batch,
+            still_gyro_dps=cfg.still_gyro_dps,
+            still_accel_ms2=cfg.still_accel_ms2,
+            tilt_warn_deg=cfg.tilt_warn_deg,
+            shock_ms2=cfg.shock_ms2,
+            gravity_tolerance_ms2=cfg.gravity_tolerance_ms2,
+        )
+        parse_ms = (time.perf_counter() - t0) * 1000.0
+
+        session.last_imu = batch
+        session.last_imu_ns = recv_ts_ns
+
+        self._send(session.identity, wire.imu_result(
+            seq=seq, ok=True, reason=wire.REASON_OK,
+            samples=batch.count,
+            payload_bytes=len(payload),
+            encoding=str(header.get("encoding", "")),
+            parse_ms=parse_ms,
+            server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+            data=batch.summary,
+            t_capture_ns=header.get("t_capture_ns"),
+            t_send_ns=header.get("t_send_ns"),
+        ))
+
     # -- send path --------------------------------------------------------
 
     def _flush_results(self) -> None:
@@ -604,6 +733,8 @@ class StreamServer:
             t_send_ns=frame.header.get("t_send_ns"),
             scan_seq=frame.scan.seq if frame.scan is not None else None,
             scan_age_ms=frame.scan_age_ms if frame.scan is not None else None,
+            imu_seq=frame.imu.seq if frame.imu is not None else None,
+            imu_age_ms=frame.imu_age_ms if frame.imu is not None else None,
         )
         self._send(session.identity, header)
 
@@ -694,16 +825,21 @@ class StreamServer:
         if elapsed < interval:
             return
 
-        if self._stat_frames or self._stat_scans:
+        if self._stat_frames or self._stat_scans or self._stat_imu_bursts:
             fps = self._stat_frames / elapsed
-            mbps = ((self._stat_bytes + self._stat_scan_bytes) * 8) / elapsed / 1e6
+            mbps = ((self._stat_bytes + self._stat_scan_bytes + self._stat_imu_bytes)
+                    * 8) / elapsed / 1e6
             avg_ms = self._stat_latency_ms / max(self._stat_frames, 1)
             log.info(
-                "%.1f fps | %.1f scans/s%s | %.1f Mbit/s | %.1f ms server-side | "
-                "%d dropped | %d session(s) | queue=%d",
+                "%.1f fps | %.1f scans/s | %.0f imu/s%s%s | %.1f Mbit/s | "
+                "%.1f ms server-side | %d dropped | %d session(s) | queue=%d",
                 fps,
                 self._stat_scans / elapsed,
+                # Samples a second, not bursts: it is the number to compare
+                # against the sensor's own rate when hunting a gap.
+                self._stat_imu_samples / elapsed,
                 self._nearest_obstacle_note(),
+                self._attitude_note(),
                 mbps, avg_ms, self._stat_dropped, len(self.sessions), len(self.frames),
             )
         elif self.sessions:
@@ -716,6 +852,9 @@ class StreamServer:
         self._stat_latency_ms = 0.0
         self._stat_scans = 0
         self._stat_scan_bytes = 0
+        self._stat_imu_bursts = 0
+        self._stat_imu_samples = 0
+        self._stat_imu_bytes = 0
 
     def _nearest_obstacle_note(self) -> str:
         """The closest thing any session can currently see, for the stats line.
@@ -735,6 +874,28 @@ class StreamServer:
             return ""
         return f" | nearest {best[0]:.2f} m @{best[1]:+.0f}°"
 
+    def _attitude_note(self) -> str:
+        """Tilt and yaw rate for the stats line, when any session has an IMU.
+
+        The counterpart to the nearest-obstacle note: two numbers that say the
+        inertial data is describing a real robot rather than merely arriving.
+        A permanent 90° tilt on a robot standing on the floor is a mounting
+        mistake, and it is visible here on the first stats line.
+        """
+        for session in self.sessions.values():
+            summary = session.last_imu.summary if session.last_imu is not None else None
+            if not summary or summary.get("tilt_deg") is None:
+                continue
+            note = " | tilt %.0f°" % summary["tilt_deg"]
+            if summary.get("yaw_rate_dps") is not None:
+                note += " yaw %+.0f°/s" % summary["yaw_rate_dps"]
+            if summary.get("tilted"):
+                note += " TILTED"
+            if summary.get("shock"):
+                note += " SHOCK"
+            return note
+        return ""
+
 
 def _describe_lidar(info: Dict[str, Any]) -> str:
     """One-line summary of what a client said about its scanner."""
@@ -748,6 +909,18 @@ def _describe_lidar(info: Dict[str, Any]) -> str:
         parts.append(f"{points} pts")
     if hz:
         parts.append(f"{float(hz):.1f} Hz")
+    return " ".join(parts)
+
+
+def _describe_imu(info: Dict[str, Any]) -> str:
+    """One-line summary of what a client said about its IMU."""
+    if not info:
+        return "none declared"
+    parts = [str(info.get("model") or info.get("source") or "?")]
+    if info.get("transport"):
+        parts.append(str(info["transport"]))
+    if info.get("rate_hz"):
+        parts.append(f"{float(info['rate_hz']):.0f} Hz")
     return " ".join(parts)
 
 
@@ -789,6 +962,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-snapshots", action="store_true", help="disable periodic frame dumps")
     p.add_argument("--no-lidar", action="store_true",
                    help="ignore scan messages (the robot is told, and stops sending)")
+    p.add_argument("--no-imu", action="store_true",
+                   help="ignore imu messages (the robot is told, and stops sending)")
     p.add_argument("--mount-yaw", type=float, default=None,
                    help="override lidar.mount_yaw_deg: bearing the camera looks along")
     p.add_argument("--hfov", type=float, default=None,
@@ -819,6 +994,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg.snapshot.enabled = False
     if args.no_lidar:
         cfg.lidar.enabled = False
+    if args.no_imu:
+        cfg.imu.enabled = False
     if args.mount_yaw is not None:
         cfg.lidar.mount_yaw_deg = args.mount_yaw
     if args.hfov is not None:

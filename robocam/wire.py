@@ -12,9 +12,10 @@ send, so the server actually handles ``[identity, header, payload]``.  DEALER
 does not insert the empty delimiter frame that REQ/REP would, so the framing is
 exactly as written above.
 
-The robot sends two streams down this one socket: camera frames at ~30 Hz and
-LiDAR scans at ~5 Hz.  They are separate message types rather than one combined
-message because the two sensors are not synchronised and never will be — pairing
+The robot sends three streams down this one socket: camera frames at ~30 Hz,
+LiDAR scans at ~5 Hz and IMU bursts at the frame rate (carrying ~100 Hz of
+inertial samples).  They are separate message types rather than one combined
+message because the sensors are not synchronised and never will be — pairing
 them at the source would mean holding a frame back to wait for a scan, which
 costs latency to buy an alignment the server can do better itself.
 
@@ -49,6 +50,8 @@ MSG_FRAME = "frame"      # client -> server, one encoded image
 MSG_RESULT = "result"    # server -> client, one result per frame
 MSG_SCAN = "scan"        # client -> server, one LiDAR revolution
 MSG_SCAN_RESULT = "scan_result"  # server -> client, one result per scan
+MSG_IMU = "imu"          # client -> server, a burst of inertial samples
+MSG_IMU_RESULT = "imu_result"    # server -> client, one result per burst
 MSG_PING = "ping"        # client -> server, liveness probe
 MSG_PONG = "pong"        # server -> client
 MSG_BYE = "bye"          # either direction, graceful close
@@ -80,6 +83,48 @@ SCAN_ENC_F32_M = "f32m"    # count * float32 LE, metres, 0/inf/nan = no return
 
 SUPPORTED_SCAN_ENCODINGS = (SCAN_ENC_U16_MM, SCAN_ENC_F32_M)
 
+# ---------------------------------------------------------------------------
+# IMU payload encoding
+# ---------------------------------------------------------------------------
+#
+# The OpenCR runs its IMU at ~100 Hz, three times the camera rate, so unlike a
+# scan an inertial sample is not something to send one message at a time — the
+# JSON header would cost more than the data and the message rate would be the
+# only thing on this link that scales with the sensor rather than with the
+# frame.  A burst carries every sample taken since the previous one, so the full
+# rate survives while the message rate stays at the camera's.
+#
+# Layout of an ``f32`` payload, for ``count`` samples over ``len(fields)``
+# channels::
+#
+#     count * int32   microseconds of each sample after ``t_capture_ns``
+#     count * k * f32 the channels of each sample, in ``fields`` order
+#
+# Offsets are relative and 32-bit because a burst spans tens of milliseconds;
+# carrying an absolute int64 per sample would double the payload to describe a
+# clock the server is forbidden from comparing against anyway (see *Clocks*).
+#
+# ``fields`` is named rather than positional so a client without one of the
+# sensors sends a shorter row instead of padding: a ``sensor_msgs/Imu`` source
+# has no magnetometer, and inventing zeros for it would read downstream as a
+# magnetometer that measures zero.
+
+IMU_ENC_F32 = "f32"
+
+SUPPORTED_IMU_ENCODINGS = (IMU_ENC_F32,)
+
+#: Every channel the protocol knows how to interpret: angular rate, specific
+#: force, magnetic field and the orientation the sensor's own filter produced.
+#: A client sends the subset it has; anything outside this tuple is carried
+#: through to the summary untouched but nothing is derived from it.
+IMU_FIELDS = ("wx", "wy", "wz", "ax", "ay", "az",
+              "mx", "my", "mz", "qw", "qx", "qy", "qz")
+
+#: Units a client may declare.  Naming them beats assuming: a gyro read as rad/s
+#: when it is deg/s is wrong by 57x and still entirely plausible-looking.
+IMU_GYRO_UNITS = ("rad/s", "deg/s")
+IMU_ACCEL_UNITS = ("m/s2", "g")
+
 # Why a result can be unsuccessful.  These end up in ``result.reason``.
 REASON_OK = "ok"
 REASON_DROPPED = "dropped"        # queue was full, frame never reached a worker
@@ -88,6 +133,8 @@ REASON_PROCESSOR_FAILED = "processor_failed"
 REASON_UNSUPPORTED_CODEC = "unsupported_codec"
 REASON_BAD_SCAN = "bad_scan"           # scan header/payload did not parse
 REASON_LIDAR_DISABLED = "lidar_disabled"  # server is configured to ignore scans
+REASON_BAD_IMU = "bad_imu"             # imu header/payload did not parse
+REASON_IMU_DISABLED = "imu_disabled"   # server is configured to ignore imu bursts
 
 
 class ProtocolError(Exception):
@@ -142,6 +189,7 @@ def hello(
     fps: float = 0.0,
     camera: str = "",
     lidar: Dict[str, Any] | None = None,
+    imu: Dict[str, Any] | None = None,
     extra: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     header = {
@@ -153,9 +201,11 @@ def hello(
         "height": height,
         "fps": fps,
         "camera": camera,
-        # Absent when the robot has no scanner attached; the server logs which
-        # sensors a session actually brought rather than guessing from traffic.
+        # Empty when the robot has no scanner or no OpenCR attached; the server
+        # logs which sensors a session actually brought rather than guessing
+        # from traffic.
         "lidar": lidar or {},
+        "imu": imu or {},
         "t_send_ns": monotonic_ns(),
     }
     if extra:
@@ -237,6 +287,8 @@ def result(
     t_send_ns: int | None = None,
     scan_seq: int | None = None,
     scan_age_ms: float | None = None,
+    imu_seq: int | None = None,
+    imu_age_ms: float | None = None,
 ) -> Dict[str, Any]:
     """Header for one result.
 
@@ -247,6 +299,7 @@ def result(
     this frame, so ``scan_seq`` missing from a result is the honest signal that
     the processor saw no ranges — as opposed to a scan of all no-returns, which
     is a different failure and reads as ``scan_seq`` present with zero coverage.
+    ``imu_seq``/``imu_age_ms`` say the same thing about the inertial burst.
     """
     header = {
         "type": MSG_RESULT,
@@ -279,6 +332,11 @@ def result(
         header["scan_seq"] = scan_seq
     if scan_age_ms is not None:
         header["scan_age_ms"] = round(scan_age_ms, 2)
+    # Likewise for the inertial burst.
+    if imu_seq is not None:
+        header["imu_seq"] = imu_seq
+    if imu_age_ms is not None:
+        header["imu_age_ms"] = round(imu_age_ms, 2)
     return header
 
 
@@ -358,6 +416,95 @@ def scan_result(
         "ok": ok,
         "reason": reason,
         "points": points,
+        "payload_bytes": payload_bytes,
+        "encoding": encoding,
+        "parse_ms": round(parse_ms, 3),
+        "server_ms": round(server_ms, 3),
+        "data": data or {},
+    }
+    if t_capture_ns is not None:
+        header["t_capture_ns"] = t_capture_ns
+    if t_send_ns is not None:
+        header["t_send_ns"] = t_send_ns
+    return header
+
+
+def imu(
+    seq: int,
+    count: int,
+    t_capture_ns: int,
+    *,
+    fields=IMU_FIELDS,
+    encoding: str = IMU_ENC_F32,
+    gyro_units: str = "rad/s",
+    accel_units: str = "m/s2",
+    rate_hz: float = 0.0,
+    dropped: int = 0,
+    source: str = "",
+    extra: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Header for one burst of inertial samples.
+
+    ``t_capture_ns`` belongs to the *first* sample in the burst; the rest are
+    placed by the microsecond offsets in the payload.  So a burst carries its
+    own internal timing exactly, and only its position on the client's clock is
+    unusable server-side — which is the same deal every other message here gets.
+
+    ``rate_hz`` is what the source believes it produces, not what arrived.  The
+    server reports the rate it measures from the offsets, and the two disagreeing
+    is the signal that samples are being lost somewhere between the sensor and
+    the socket.  ``dropped`` counts samples the client's own buffer had to
+    discard since the last burst, which is the other half of that story: a gap
+    the client knows about is worth stating rather than leaving to be inferred
+    from a rate that came out low.
+    """
+    header = {
+        "type": MSG_IMU,
+        "seq": seq,
+        "encoding": encoding,
+        "count": count,
+        "fields": list(fields),
+        "gyro_units": gyro_units,
+        "accel_units": accel_units,
+        "rate_hz": rate_hz,
+        "dropped": dropped,
+        "source": source,
+        "t_capture_ns": t_capture_ns,
+        "t_send_ns": monotonic_ns(),
+    }
+    if extra:
+        header["extra"] = extra
+    return header
+
+
+def imu_result(
+    seq: int,
+    ok: bool,
+    reason: str = REASON_OK,
+    *,
+    samples: int = 0,
+    payload_bytes: int = 0,
+    encoding: str = "",
+    parse_ms: float = 0.0,
+    server_ms: float = 0.0,
+    data: Dict[str, Any] | None = None,
+    t_capture_ns: int | None = None,
+    t_send_ns: int | None = None,
+) -> Dict[str, Any]:
+    """Header for one IMU burst result.
+
+    Answered from the IO thread, for the same reason scans are: reducing a
+    hundred samples to attitude, rates and a still/moving decision is a few
+    numpy passes, and inertial data is the most perishable thing on the link —
+    routing it through the frame queue would deliver "the robot is tipping" a
+    model's worth of latency after it started to.
+    """
+    header = {
+        "type": MSG_IMU_RESULT,
+        "seq": seq,
+        "ok": ok,
+        "reason": reason,
+        "samples": samples,
         "payload_bytes": payload_bytes,
         "encoding": encoding,
         "parse_ms": round(parse_ms, 3),

@@ -121,6 +121,33 @@ ranges is worse than failing, so a raw device is only ever used if you name one.
 
 Serial mode needs `pip3 install pyserial`.
 
+IMU flags (the robot's OpenCR board, ~100 Hz of inertial samples sent in bursts
+alongside the frames):
+
+```bash
+--imu auto                  # ros2 topic first, then the board; off by default
+--imu-topic /opencr_state   # the mecanumbot IO node's own topic
+--imu-msg auto              # opencr = mecanumbot_msgs/OpenCRState, imu = sensor_msgs/Imu
+--imu-port /dev/opencr      # only for --imu serial
+--imu-health-every 5        # seconds between progress reports, 0 to silence
+--print-imu                 # dump every imu result as JSON
+```
+
+**`--imu auto` prefers ROS 2 for a reason the scanner does not have.** The
+OpenCR's serial port is normally owned by `mecanumbot_io_node` — the node driving
+the wheels — and two processes reading one tty do not each get the stream, they
+split it, so both frame garbage. Subscribing to what that node already publishes
+costs nothing; competing for its port costs motor control. The serial path is the
+fallback for a robot without the node running, and it refuses to open a port
+another process is holding unless you pass `--imu-allow-shared-port`.
+
+Samples go out in bursts rather than one message each: at 100 Hz the JSON header
+would cost more than the data, so a burst carries everything taken since the last
+frame and the message rate stays at the camera's while the sample rate stays at
+the sensor's. Bursts that the client's own queue had to discard are counted and
+the count travels with the next one, so a gap shows up as a number rather than as
+a rate that quietly came out low.
+
 Or use it as a library:
 
 ```python
@@ -199,6 +226,34 @@ that check the client would sit silent on `/scan` forever instead of falling
 through to the serial device. It also distinguishes "nothing publishes `/scan`"
 (driver down) from "a publisher exists but sends nothing" (driver up, scanner
 not producing).
+
+### What the IMU can and cannot tell you
+
+Worth being blunt about, because the temptation to treat it as a pose source is
+strong and the failure is silent:
+
+* **Attitude is honest.** Roll and pitch are observable — gravity is a permanent
+  reference — so "the robot is tipping" or "this ramp is 8°" is real.
+* **Yaw is not.** Nothing in a gyro fixes an absolute heading, so `yaw_deg` has an
+  arbitrary origin and drifts degrees per minute. Use `yaw_rate_dps` for control.
+  The magnetometer would fix it in principle and does not in practice: it sits
+  centimetres from four motors whose field swamps the Earth's.
+* **Position is not, at all.** Double-integrating this accelerometer gives metres
+  of error in seconds. Wheel odometry and the LiDAR are the position sensors.
+
+Axes follow the ROS body convention the OpenCR firmware uses: **x forward, y
+left, z up**, so a level robot at rest reads `az ≈ +9.81` and nothing else. That
+is the assumption most likely to be wrong on a rebuilt robot, so the snapshot
+draws an attitude disc in the corner opposite the scan plot: **a robot standing on
+a flat floor must show a level horizon.** A permanent 90° tilt means the board is
+mounted on a different axis and every attitude number is rotated with it — the
+same class of mistake as a wrong `mount_yaw_deg`, caught the same way, by looking.
+
+Two summary fields exist to catch the other silent failure. `gravity_ok` goes
+false when the mean specific force is not near 9.81, which is what a units
+mistake or a dead axis looks like; `rate_hz` is measured from the samples' own
+offsets, so it disagreeing with the board's declared 100 Hz means samples are
+being lost between the sensor and the socket.
 
 `skipped` climbing means the server cannot keep up and the client is dropping at
 the source. `bad` climbing with `reason: "dropped"` means the server's queue is

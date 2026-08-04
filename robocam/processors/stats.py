@@ -34,18 +34,24 @@ class StatsProcessor(Processor):
         "is the LiDAR arriving too?" from the same result line that answers the
         question for the camera.  Use the ``fusion`` processor for anything that
         relates the ranges to the image.
+    imu:
+        Same for the inertial burst from the OpenCR: attitude, rates and whether
+        the robot is moving, already reduced on the IO thread.
     """
 
     name = "stats"
 
     def __init__(self, brightness: bool = True, checksum: bool = False,
-                 lidar: bool = True, **options: Any) -> None:
-        super().__init__(brightness=brightness, checksum=checksum, lidar=lidar, **options)
+                 lidar: bool = True, imu: bool = True, **options: Any) -> None:
+        super().__init__(brightness=brightness, checksum=checksum, lidar=lidar,
+                         imu=imu, **options)
         self.brightness = bool(brightness)
         self.checksum = bool(checksum)
         self.lidar = bool(lidar)
+        self.imu = bool(imu)
         self._count = 0
         self._scans = 0
+        self._bursts = 0
         self._first_ts: Optional[float] = None
         self._last_ts: Optional[float] = None
         self._last_interval_ms = 0.0
@@ -53,6 +59,7 @@ class StatsProcessor(Processor):
     def setup(self) -> None:
         self._count = 0
         self._scans = 0
+        self._bursts = 0
         self._first_ts = None
         self._last_ts = None
 
@@ -114,5 +121,21 @@ class StatsProcessor(Processor):
                 # camera's rate — but near 0.0 means the pairing window in
                 # lidar.stale_after_ms is too tight for the scanner's speed.
                 data["scan_fraction"] = round(self._scans / self._count, 3)
+
+        if self.imu:
+            if frame.imu is None:
+                # Explicit None for the same reason as the scan: "this robot has
+                # no IMU" and "the burst went stale" are both actionable, and a
+                # missing key is neither.
+                data["imu"] = None
+            else:
+                self._bursts += 1
+                data["imu"] = dict(frame.imu.summary)
+                data["imu"]["imu_seq"] = frame.imu.seq
+                data["imu"]["age_ms"] = round(frame.imu_age_ms, 1)
+                # Should sit near 1.0: the IMU runs several times faster than the
+                # camera, so every frame ought to find a burst waiting.  Well
+                # below 1.0 means bursts are not arriving, not that they are rare.
+                data["imu_fraction"] = round(self._bursts / self._count, 3)
 
         return data

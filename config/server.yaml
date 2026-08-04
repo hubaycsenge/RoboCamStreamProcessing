@@ -34,6 +34,7 @@ processor:
     brightness: true    # mean/std, catches a lens cap or a frozen buffer
     checksum: false     # enable to detect an identical frame being resent
     lidar: true         # include the scan summary when one is attached
+    imu: true           # include the inertial summary when one is attached
 
 lidar:
   # The robot's LDS-02: 360 points a revolution, ~5 Hz, 0.12-12 m, one
@@ -63,6 +64,35 @@ lidar:
   # frames get no ranges at all; much above it and the robot fuses a stale world.
   stale_after_ms: 400.0
 
+imu:
+  # The robot's IMU, on the OpenCR board: ~100 Hz of angular rate, specific
+  # force, magnetic field and a board-computed orientation quaternion. Samples
+  # arrive in bursts on the same socket as the frames, are answered from the IO
+  # thread, and the newest burst is attached to the next frame.
+  #
+  # Axes are the ROS body convention the OpenCR firmware uses: x forward, y
+  # left, z up. A level robot at rest reads az = +9.81 and nothing else; if the
+  # summary shows a permanent 90 degree tilt, the board is mounted on a
+  # different axis and every attitude number is rotated with it.
+  enabled: true
+
+  # --- thresholds: when a state becomes true ---
+  still_gyro_dps: 2.0       # above this the robot counts as turning
+  still_accel_ms2: 0.35     # spread of |accel| above which it counts as shaking
+  tilt_warn_deg: 15.0       # tilt beyond which the summary says so
+  shock_ms2: 25.0           # peak |accel| treated as an impact (2.5 g)
+
+  # --- health ---
+  # How far mean |accel| may sit from 9.81 before a burst is flagged
+  # implausible. This is what catches a units mistake or a dead axis, which
+  # otherwise produce confident nonsense rather than an obvious error.
+  gravity_tolerance_ms2: 2.0
+
+  # A burst older than this is not attached to a frame. Much tighter than the
+  # LiDAR's window because the IMU runs 20x faster: inertial data 150 ms old
+  # means something is broken, not merely slow.
+  stale_after_ms: 150.0
+
 snapshot:
   # Periodically write a decoded frame to disk so you can confirm from your
   # laptop, over the sshfs mount, that real images are arriving.
@@ -74,6 +104,10 @@ snapshot:
   # Draw the scan on the snapshot: bird's-eye plot plus a depth strip aligned to
   # the image columns. This is how you check mount_yaw_deg without writing code.
   lidar_overlay: true
+  # Draw the attitude from the IMU burst: a horizon disc in the opposite corner.
+  # A robot on a flat floor must show a level horizon; if it does not, the
+  # OpenCR is mounted on a different axis than the config assumes.
+  imu_overlay: true
 
 logging:
   level: INFO

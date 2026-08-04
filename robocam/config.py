@@ -116,6 +116,51 @@ class LidarConfig:
 
 
 @dataclass
+class ImuConfig:
+    """How to interpret the bursts coming off the robot's OpenCR board.
+
+    Unlike the LiDAR section there is no mounting geometry here, because the IMU
+    is bolted to the chassis and reports the chassis's own motion: nothing has to
+    be related to the camera.  What is here is thresholds — the points at which
+    "the robot is turning", "something hit it" and "it is leaning over" become
+    true — and they are robot-specific in a way the defaults cannot be.
+    """
+
+    enabled: bool = True
+    # Angular rate above which the robot counts as turning.  Just above the
+    # noise floor of a MEMS gyro at rest, which is a degree or two per second.
+    still_gyro_dps: float = 2.0
+    # Spread of specific force above which it counts as shaking.  A robot
+    # driving over a hard floor sits around 0.2-0.5 m/s²; a stationary one is
+    # an order of magnitude below that.
+    still_accel_ms2: float = 0.35
+    # Tilt beyond which the summary says so.  15° is a slope this robot should
+    # not be on, not the angle it tips over at.
+    tilt_warn_deg: float = 15.0
+    # Peak specific force treated as an impact.  2.5 g — well clear of driving
+    # over a cable, well below what a fall produces.
+    shock_ms2: float = 25.0
+    # How far the mean specific force may sit from gravity before the burst is
+    # flagged implausible.  Catches a units mistake or a dead axis, which are
+    # the two failures that otherwise produce confident nonsense.
+    gravity_tolerance_ms2: float = 2.0
+    # A burst older than this is not attached to a frame.  Much tighter than the
+    # LiDAR's window because the IMU runs 20x faster: if the newest inertial
+    # data is 150 ms old, something is wrong rather than merely slow.
+    stale_after_ms: float = 150.0
+
+    def __post_init__(self) -> None:
+        if self.still_gyro_dps < 0.0:
+            raise ConfigError("imu.still_gyro_dps must be >= 0")
+        if self.still_accel_ms2 < 0.0:
+            raise ConfigError("imu.still_accel_ms2 must be >= 0")
+        if not 0.0 < self.tilt_warn_deg <= 180.0:
+            raise ConfigError("imu.tilt_warn_deg must be in (0, 180]")
+        if self.shock_ms2 <= 0.0:
+            raise ConfigError("imu.shock_ms2 must be > 0")
+
+
+@dataclass
 class SnapshotConfig:
     """Periodically write a decoded frame to disk.
 
@@ -134,6 +179,10 @@ class SnapshotConfig:
     # strip aligned to the image columns.  This is how you check the LiDAR
     # agrees with what the camera sees without writing any code.
     lidar_overlay: bool = True
+    # Draw the attached IMU burst: an attitude disc in the opposite corner.  A
+    # robot on a flat floor must show a level horizon, which is how you check
+    # the board's mounting without writing any code either.
+    imu_overlay: bool = True
 
 
 @dataclass
@@ -149,6 +198,7 @@ class Config:
     queue: QueueConfig = field(default_factory=QueueConfig)
     processor: ProcessorConfig = field(default_factory=ProcessorConfig)
     lidar: LidarConfig = field(default_factory=LidarConfig)
+    imu: ImuConfig = field(default_factory=ImuConfig)
     snapshot: SnapshotConfig = field(default_factory=SnapshotConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
@@ -178,6 +228,7 @@ class Config:
             ("queue", QueueConfig),
             ("processor", ProcessorConfig),
             ("lidar", LidarConfig),
+            ("imu", ImuConfig),
             ("snapshot", SnapshotConfig),
             ("logging", LoggingConfig),
         ):

@@ -7,8 +7,9 @@ and VGGT will attach — the wire protocol does not change when they do.
 Contract
 --------
 * ``configure`` runs once, on the server's thread, before ``setup``.  It hands
-  over the robot's LiDAR geometry so that a processor which projects scans into
-  the image does not need its own copy of numbers that describe the hardware.
+  over the robot's LiDAR geometry and IMU thresholds so that a processor which
+  projects scans into the image does not need its own copy of numbers that
+  describe the hardware.
 * ``setup`` runs once in the worker thread before any frame.  Load weights and
   do warm-up passes here, not in ``__init__``, so that startup cost is paid on
   the thread that owns the CUDA context.
@@ -27,6 +28,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
+from ..imu import ImuBatch
 from ..lidar import Scan
 
 
@@ -54,6 +56,14 @@ class Frame:
     # Age of that scan in milliseconds when it was attached, on the server's
     # clock.  Nonzero even for a fresh scan: at 5 Hz, ~100 ms is normal.
     scan_age_ms: float = 0.0
+    # The most recent burst of inertial samples from the OpenCR, on the same
+    # terms as ``scan``: None whenever the robot has no IMU, the server has it
+    # disabled, or the burst went stale (imu.stale_after_ms).  Its ``summary``
+    # is already computed; see robocam/imu.py.
+    imu: Optional[ImuBatch] = None
+    # Age of that burst in milliseconds when it was attached.  At ~100 Hz and a
+    # burst per frame this is small; tens of milliseconds is normal.
+    imu_age_ms: float = 0.0
 
     @property
     def width(self) -> int:
@@ -77,13 +87,14 @@ class Processor(abc.ABC):
     def __init__(self, **options: Any) -> None:
         self.options = options
 
-    def configure(self, lidar_cfg: Any) -> None:
-        """Called once with the server's ``LidarConfig`` before ``setup``.
+    def configure(self, lidar_cfg: Any, imu_cfg: Any = None) -> None:
+        """Called once with the server's sensor config before ``setup``.
 
         Ignore it unless the processor needs to relate scan bearings to image
         columns; the mounting yaw and the lens field of view are properties of
         the robot, so they live in the server config rather than in each
-        processor's options.
+        processor's options.  ``imu_cfg`` defaults to None so that a processor
+        written before the IMU existed still satisfies this signature.
         """
 
     def setup(self) -> None:
