@@ -6,6 +6,9 @@ and VGGT will attach — the wire protocol does not change when they do.
 
 Contract
 --------
+* ``configure`` runs once, on the server's thread, before ``setup``.  It hands
+  over the robot's LiDAR geometry so that a processor which projects scans into
+  the image does not need its own copy of numbers that describe the hardware.
 * ``setup`` runs once in the worker thread before any frame.  Load weights and
   do warm-up passes here, not in ``__init__``, so that startup cost is paid on
   the thread that owns the CUDA context.
@@ -24,6 +27,8 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
+from ..lidar import Scan
+
 
 @dataclass
 class Frame:
@@ -40,6 +45,15 @@ class Frame:
     decode_ms: float = 0.0
     # Size of the encoded payload on the wire.
     payload_bytes: int = 0
+    # The most recent LiDAR revolution, if one arrived recently enough to still
+    # describe the same world (lidar.stale_after_ms).  None whenever the robot
+    # has no scanner, the server has LiDAR disabled, or the scan went stale —
+    # a processor must handle that case rather than assume ranges are there.
+    # Its ``summary`` is already computed; see robocam/lidar.py.
+    scan: Optional[Scan] = None
+    # Age of that scan in milliseconds when it was attached, on the server's
+    # clock.  Nonzero even for a fresh scan: at 5 Hz, ~100 ms is normal.
+    scan_age_ms: float = 0.0
 
     @property
     def width(self) -> int:
@@ -62,6 +76,15 @@ class Processor(abc.ABC):
 
     def __init__(self, **options: Any) -> None:
         self.options = options
+
+    def configure(self, lidar_cfg: Any) -> None:
+        """Called once with the server's ``LidarConfig`` before ``setup``.
+
+        Ignore it unless the processor needs to relate scan bearings to image
+        columns; the mounting yaw and the lens field of view are properties of
+        the robot, so they live in the server config rather than in each
+        processor's options.
+        """
 
     def setup(self) -> None:
         """Called once in the worker thread before the first frame."""

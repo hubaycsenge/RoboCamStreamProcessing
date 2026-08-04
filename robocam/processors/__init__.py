@@ -7,6 +7,10 @@ Planned additions (see README):
     "yolo"   -> ultralytics detection, per-frame
     "mast3r" -> two-view matching / relative pose, on keyframe pairs
     "vggt"   -> multi-view geometry over a sliding keyframe window
+
+A detector will most likely want to subclass or borrow from "fusion", which
+already turns an image column into metres using the LDS-02 scan attached to the
+frame.
 """
 
 from __future__ import annotations
@@ -38,11 +42,13 @@ def available() -> list[str]:
 
 # -- built-ins ---------------------------------------------------------------
 
+from .fusion import FusionProcessor  # noqa: E402
 from .noop import NoopProcessor  # noqa: E402
 from .stats import StatsProcessor  # noqa: E402
 
 register("stats", StatsProcessor)
 register("noop", NoopProcessor)
+register("fusion", FusionProcessor)
 
 __all__ = [
     "Frame",
@@ -53,4 +59,5 @@ __all__ = [
     "available",
     "StatsProcessor",
     "NoopProcessor",
+    "FusionProcessor",
 ]

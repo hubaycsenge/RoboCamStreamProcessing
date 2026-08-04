@@ -2,8 +2,9 @@
 """RoboCam client — runs on the Jetson Orin Nano.
 
 Captures the webcam, encodes each frame, streams it to the server and hands the
-returned result to a callback.  Single file with no dependency on the ``robocam``
-package, so deploying it is one ``scp``.
+returned result to a callback.  If the robot's LDS-02 LiDAR is attached, its
+scans go down the same socket alongside the frames.  Single file with no
+dependency on the ``robocam`` package, so deploying it is one ``scp``.
 
     pip3 install pyzmq numpy opencv-python      # opencv usually already on JetPack
     python3 robocam_client.py --server tcp://10.128.17.196:5555
@@ -12,10 +13,20 @@ Test the link without a camera:
 
     python3 robocam_client.py --server tcp://10.128.17.196:5555 --source synthetic
 
+Camera plus LiDAR, the normal robot configuration:
+
+    python3 robocam_client.py --server tcp://10.128.17.196:5555 --lidar auto
+
 Use as a library:
 
     client = RoboCamClient("tcp://10.128.17.196:5555", on_result=my_callback)
-    client.run()
+    client.run(OpenCVSource("0"), scan_source=build_scan_source_auto())
+
+The camera and the LiDAR are read independently — the scanner runs on its own
+thread with a latest-wins slot — because they run at different rates (~30 Hz and
+~5 Hz) and neither should ever wait for the other.  The server pairs them by
+arrival time; see the module docstring of robocam/lidar.py for what that pairing
+does and does not justify.
 """
 
 from __future__ import annotations
@@ -23,10 +34,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import signal
+import struct
 import sys
+import threading
 import time
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import zmq
@@ -39,6 +53,8 @@ MSG_HELLO = "hello"
 MSG_WELCOME = "welcome"
 MSG_FRAME = "frame"
 MSG_RESULT = "result"
+MSG_SCAN = "scan"
+MSG_SCAN_RESULT = "scan_result"
 MSG_PING = "ping"
 MSG_PONG = "pong"
 MSG_BYE = "bye"
@@ -46,6 +62,10 @@ MSG_ERROR = "error"
 
 CODEC_JPEG = "jpeg"
 CODEC_RAW_BGR = "raw_bgr"
+
+SCAN_ENC_U16_MM = "u16mm"
+
+TWO_PI = 2.0 * math.pi
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +249,495 @@ class GstJpegSource(FrameSource):
             pass
 
 
+class NullSource(FrameSource):
+    """No camera at all, paced so the main loop keeps servicing the LiDAR.
+
+    For running the robot's scanner on its own — while the camera is unplugged,
+    or to measure what the LiDAR path costs by itself.
+    """
+
+    def __init__(self, hz: float = 50.0) -> None:
+        self.width = self.height = 0
+        self.fps = 0.0
+        self.period = 1.0 / hz if hz > 0 else 0.02
+
+    def frames(self):
+        while True:
+            time.sleep(self.period)
+            yield None, None
+
+
+# ---------------------------------------------------------------------------
+# LiDAR sources
+# ---------------------------------------------------------------------------
+#
+# The robot's LDS-02 is a planar 360° scanner: ~5 Hz, 0.12–12 m, 360 points a
+# revolution, reported in millimetres.  Two ways in, and which one you have
+# depends on how the Orin is set up rather than on anything here:
+#
+#   ros2    — the LDS-02 is already published as sensor_msgs/LaserScan on /scan
+#             by ld08_driver.  Use this if ROS is running; it is the one that
+#             keeps working when someone re-mounts the scanner and updates the
+#             URDF instead of telling you.
+#   serial  — talk to the device directly over its USB serial link (230400
+#             baud, the LD08/LD19 packet format).  Use this if there is no ROS
+#             on the robot, or to take the scanner away from ROS entirely.
+#
+# ``--lidar auto`` tries them in that order.  It deliberately does *not* fall
+# back to the synthetic scanner: a robot that silently reports a fictional room
+# is far worse than one that reports no LiDAR at all.
+
+
+class ScanReading:
+    """One revolution, in the form the wire wants it.
+
+    ``ranges_mm`` is uint16 millimetres with 0 for "no return", which is the
+    LDS-02's own convention and needs no conversion in either direction.
+    """
+
+    __slots__ = ("ranges_mm", "angle_min", "angle_increment", "range_min",
+                 "range_max", "scan_time", "intensities", "t_capture_ns")
+
+    def __init__(
+        self,
+        ranges_mm: np.ndarray,
+        angle_min: float = 0.0,
+        angle_increment: float = 0.0,
+        range_min: float = 0.0,
+        range_max: float = 0.0,
+        scan_time: float = 0.0,
+        intensities: Optional[np.ndarray] = None,
+        t_capture_ns: int = 0,
+    ) -> None:
+        self.ranges_mm = ranges_mm
+        self.angle_min = angle_min
+        self.angle_increment = angle_increment
+        self.range_min = range_min
+        self.range_max = range_max
+        self.scan_time = scan_time
+        self.intensities = intensities
+        self.t_capture_ns = t_capture_ns or time.monotonic_ns()
+
+    def __len__(self) -> int:
+        return int(self.ranges_mm.shape[0])
+
+
+class ScanSource:
+    """Yields :class:`ScanReading` objects, one per revolution."""
+
+    #: Reported to the server in ``hello.lidar``, and used in log lines.
+    model = "lidar"
+
+    def info(self) -> Dict[str, Any]:
+        return {"model": self.model}
+
+    def scans(self) -> Iterator[ScanReading]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class SyntheticScanSource(ScanSource):
+    """A fake room: rectangular walls and one obstacle circling the robot.
+
+    Never selected automatically — pass ``--lidar synthetic`` on purpose.  Its
+    job is to prove the scan path end to end (client, wire, server analysis,
+    overlay) without needing the robot powered up, and the shapes are chosen so
+    that a wrong sign or a wrong mounting yaw is visible in the bird's-eye plot
+    rather than hidden in plausible-looking numbers.
+    """
+
+    model = "synthetic"
+
+    def __init__(self, points: int = 360, hz: float = 5.0,
+                 room: Tuple[float, float, float, float] = (-2.0, 4.0, -3.0, 3.0)) -> None:
+        self.points = int(points)
+        self.hz = float(hz)
+        self.room = room
+        self.range_min, self.range_max = 0.12, 12.0
+
+    def info(self) -> Dict[str, Any]:
+        return {"model": self.model, "points": self.points, "hz": self.hz,
+                "note": "SYNTHETIC — not a real sensor"}
+
+    def scans(self) -> Iterator[ScanReading]:
+        period = 1.0 / self.hz if self.hz > 0 else 0.2
+        bearings = np.linspace(0.0, TWO_PI, self.points, endpoint=False, dtype=np.float64)
+        dx, dy = np.cos(bearings), np.sin(bearings)
+        xmin, xmax, ymin, ymax = self.room
+        i = 0
+
+        while True:
+            t0 = time.perf_counter()
+            # Distance to the walls of an axis-aligned box, from inside it.
+            t = np.full(self.points, np.inf)
+            for delta, direction in ((xmin, dx), (xmax, dx), (ymin, dy), (ymax, dy)):
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    hit = delta / np.where(np.abs(direction) < 1e-9, np.nan, direction)
+                t = np.minimum(t, np.where(hit > 0, hit, np.inf))
+
+            # One obstacle orbiting the robot, so successive scans differ and a
+            # frozen feed is as obvious as a frozen camera.
+            angle = i * 0.05
+            ox, oy, radius = 1.2 * math.cos(angle), 1.2 * math.sin(angle), 0.30
+            b = -2.0 * (dx * ox + dy * oy)
+            c = ox * ox + oy * oy - radius * radius
+            disc = b * b - 4.0 * c
+            with np.errstate(invalid="ignore"):
+                root = (-b - np.sqrt(np.where(disc > 0, disc, np.nan))) / 2.0
+            t = np.minimum(t, np.where(np.isfinite(root) & (root > 0), root, np.inf))
+
+            ranges = np.where(np.isfinite(t) & (t <= self.range_max), t, 0.0)
+            yield ScanReading(
+                ranges_mm=_pack_mm(ranges),
+                angle_min=0.0,
+                angle_increment=TWO_PI / self.points,
+                range_min=self.range_min,
+                range_max=self.range_max,
+                scan_time=period,
+            )
+            i += 1
+            sleep = period - (time.perf_counter() - t0)
+            if sleep > 0:
+                time.sleep(sleep)
+
+
+class Ros2ScanSource(ScanSource):
+    """sensor_msgs/LaserScan off a ROS 2 topic, normally ``/scan``.
+
+    Uses ``rclpy`` with a best-effort, depth-1 subscription: the sensor QoS
+    profile most LiDAR drivers publish with, and the one that matches what this
+    client wants anyway — the newest revolution, never a backlog of old ones.
+    """
+
+    model = "lds02-ros2"
+
+    def __init__(self, topic: str = "/scan", timeout_s: float = 5.0) -> None:
+        import rclpy
+        from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+        from sensor_msgs.msg import LaserScan
+
+        self._rclpy = rclpy
+        if not rclpy.ok():
+            rclpy.init(args=None)
+        self._node = rclpy.create_node("robocam_lidar_client")
+        qos = QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        self._slot: Optional[Any] = None
+        self._lock = threading.Lock()
+        self._new = threading.Event()
+        self._topic = topic
+        self._timeout_s = timeout_s
+        self._sub = self._node.create_subscription(LaserScan, topic, self._on_msg, qos)
+        log.info("lidar: subscribed to %s", topic)
+
+    def info(self) -> Dict[str, Any]:
+        return {"model": self.model, "topic": self._topic, "transport": "ros2"}
+
+    def _on_msg(self, msg) -> None:
+        with self._lock:
+            self._slot = msg
+        self._new.set()
+
+    def scans(self) -> Iterator[ScanReading]:
+        waited = 0.0
+        while True:
+            self._rclpy.spin_once(self._node, timeout_sec=0.05)
+            if not self._new.is_set():
+                waited += 0.05
+                if waited > self._timeout_s:
+                    log.warning("lidar: nothing on %s for %.0fs — is the driver running?",
+                                self._topic, waited)
+                    waited = 0.0
+                continue
+            waited = 0.0
+            self._new.clear()
+            with self._lock:
+                msg = self._slot
+            if msg is None:
+                continue
+
+            ranges = np.asarray(msg.ranges, dtype=np.float32)
+            # ROS uses inf for "nothing within range" and nan for "no reading";
+            # both are no-returns, which _pack_mm encodes as zero.
+            yield ScanReading(
+                ranges_mm=_pack_mm(ranges),
+                angle_min=float(msg.angle_min),
+                angle_increment=float(msg.angle_increment),
+                range_min=float(msg.range_min),
+                range_max=float(msg.range_max),
+                scan_time=float(getattr(msg, "scan_time", 0.0) or 0.0),
+            )
+
+    def close(self) -> None:
+        try:
+            self._node.destroy_node()
+        except Exception:
+            pass
+
+
+class SerialLdsSource(ScanSource):
+    """The LDS-02 over its USB serial link, no ROS involved.
+
+    The device streams 47-byte packets at 230400 baud, each carrying 12 points
+    with a start and end angle to interpolate between (the LD08/LD19 format that
+    the LDS-02 uses).  Points are accumulated into a fixed 360-bin table and a
+    revolution is emitted when the angle wraps past zero.
+
+    Two details worth knowing before you debug this against hardware:
+
+    * **Spin direction.** The device numbers its angles in the direction it
+      turns, which is clockwise seen from above, while ``LaserScan`` and this
+      protocol are counter-clockwise-positive.  That is expressed as a negative
+      ``angle_increment`` rather than by reversing the array, so the raw bins
+      stay in device order and only one number carries the convention.  If the
+      bird's-eye plot in the snapshot comes out mirrored, this is the flag:
+      ``--lidar-spin ccw``.
+    * **CRC.** Packets carry a CRC-8 (polynomial 0x4D).  The default ``auto``
+      mode checks it, and if nearly everything fails in the first second it
+      concludes the checksum convention differs on this unit and carries on
+      without it rather than reporting a dead scanner.  ``--lidar-crc check``
+      makes a mismatch fatal to the packet; ``ignore`` skips it entirely.
+    """
+
+    model = "lds02-serial"
+
+    HEADER = 0x54
+    VER_LEN = 0x2C
+    POINTS_PER_PACKET = 12
+    PACKET_BYTES = 47
+
+    def __init__(self, port: str = "/dev/ttyUSB0", baud: int = 230400, points: int = 360,
+                 spin: str = "cw", crc: str = "auto", timeout: float = 1.0) -> None:
+        import serial  # pyserial
+
+        self.port, self.baud = port, int(baud)
+        self.points = int(points)
+        self.spin = spin
+        self.crc_mode = crc
+        self.range_min, self.range_max = 0.12, 12.0
+        self._ser = serial.Serial(port, self.baud, timeout=timeout)
+        self._buf = bytearray()
+        self._crc_ok = 0
+        self._crc_bad = 0
+        self._crc_checking = crc != "ignore"
+        self._speed_dps = 0.0
+        log.info("lidar: %s at %d baud (%s spin, crc=%s)", port, self.baud, spin, crc)
+
+    def info(self) -> Dict[str, Any]:
+        return {"model": self.model, "port": self.port, "points": self.points,
+                "spin": self.spin, "transport": "serial"}
+
+    def scans(self) -> Iterator[ScanReading]:
+        ranges = np.zeros(self.points, dtype=np.uint16)
+        intensities = np.zeros(self.points, dtype=np.uint8)
+        filled = 0
+        last_start_cdeg = None
+
+        while True:
+            chunk = self._ser.read(512)
+            if not chunk:
+                continue
+            self._buf.extend(chunk)
+
+            for start_cdeg, points in self._packets():
+                # A start angle lower than the previous one means the scanner
+                # has come back round past zero: that is one revolution.
+                if last_start_cdeg is not None and start_cdeg < last_start_cdeg:
+                    if filled >= self.points // 4:
+                        yield self._reading(ranges, intensities)
+                        ranges = np.zeros(self.points, dtype=np.uint16)
+                        intensities = np.zeros(self.points, dtype=np.uint8)
+                        filled = 0
+                    else:
+                        # Too sparse to be a revolution — a partial scan from
+                        # mid-stream startup, or the device spinning up.
+                        log.debug("lidar: discarding sparse revolution (%d/%d points)",
+                                  filled, self.points)
+                        ranges[:] = 0
+                        intensities[:] = 0
+                        filled = 0
+                last_start_cdeg = start_cdeg
+
+                for cdeg, distance_mm, intensity in points:
+                    if distance_mm == 0:
+                        continue
+                    index = int(round(cdeg / 100.0 * self.points / 360.0)) % self.points
+                    if ranges[index] == 0:
+                        filled += 1
+                    # Nearest wins where two beams land in one bin: for
+                    # obstacle avoidance the closer return is the one that
+                    # matters, and averaging across a depth discontinuity
+                    # invents a surface that is not there.
+                    if ranges[index] == 0 or distance_mm < ranges[index]:
+                        ranges[index] = distance_mm
+                        intensities[index] = intensity
+
+    def _reading(self, ranges: np.ndarray, intensities: np.ndarray) -> ScanReading:
+        # Clockwise device, counter-clockwise protocol: carried entirely by the
+        # sign of angle_increment.
+        step = TWO_PI / self.points
+        return ScanReading(
+            ranges_mm=ranges.copy(),
+            angle_min=0.0,
+            angle_increment=-step if self.spin == "cw" else step,
+            range_min=self.range_min,
+            range_max=self.range_max,
+            scan_time=(360.0 / self._speed_dps) if self._speed_dps > 0 else 0.0,
+            intensities=intensities.copy(),
+        )
+
+    def _packets(self):
+        """Yield ``(start_centidegrees, [(centideg, mm, intensity), ...])``."""
+        buf = self._buf
+        while True:
+            start = buf.find(bytes([self.HEADER, self.VER_LEN]))
+            if start < 0:
+                # Keep one byte in case a header straddles two reads.
+                del buf[:max(0, len(buf) - 1)]
+                return
+            if start:
+                del buf[:start]
+            if len(buf) < self.PACKET_BYTES:
+                return
+
+            packet = bytes(buf[:self.PACKET_BYTES])
+            if self._crc_checking and not self._check_crc(packet):
+                # 0x54 0x2C can occur inside a distance field, so a failed CRC
+                # is as likely to mean "synced to the wrong offset" as "corrupt
+                # packet".  Advance one byte and look again rather than
+                # swallowing 47 bytes of what may be a real packet.
+                del buf[:1]
+                continue
+            del buf[:self.PACKET_BYTES]
+
+            speed, start_cdeg = struct.unpack_from("<HH", packet, 2)
+            end_cdeg, = struct.unpack_from("<H", packet, 42)
+            self._speed_dps = float(speed)
+
+            span = (end_cdeg - start_cdeg) % 36000
+            step = span / (self.POINTS_PER_PACKET - 1) if self.POINTS_PER_PACKET > 1 else 0.0
+
+            points = []
+            for i in range(self.POINTS_PER_PACKET):
+                distance, intensity = struct.unpack_from("<HB", packet, 6 + i * 3)
+                points.append(((start_cdeg + step * i) % 36000, distance, intensity))
+            yield start_cdeg, points
+
+    def _check_crc(self, packet: bytes) -> bool:
+        if _crc8(packet[:-1]) == packet[-1]:
+            self._crc_ok += 1
+            return True
+        self._crc_bad += 1
+        if (self.crc_mode == "auto" and self._crc_bad >= 50
+                and self._crc_bad > 4 * self._crc_ok):
+            # Data is clearly arriving — packets are being framed — but the
+            # checksum does not agree.  Refusing every packet would present a
+            # working scanner as a dead one, so say what happened and use it.
+            log.warning("lidar: %d of %d packets failed CRC; disabling the check. "
+                        "Ranges are still being framed, but a corrupt packet will "
+                        "now get through — pass --lidar-crc check to be strict.",
+                        self._crc_bad, self._crc_bad + self._crc_ok)
+            self._crc_checking = False
+        return False
+
+    def close(self) -> None:
+        try:
+            self._ser.close()
+        except Exception:
+            pass
+
+
+def _crc8_table() -> List[int]:
+    """CRC-8 table for polynomial 0x4D, as used by the LD08/LD19 packet format."""
+    table = []
+    for i in range(256):
+        value = i
+        for _ in range(8):
+            value = ((value << 1) ^ 0x4D) & 0xFF if value & 0x80 else (value << 1) & 0xFF
+        table.append(value)
+    return table
+
+
+_CRC8_TABLE = _crc8_table()
+
+
+def _crc8(data: bytes) -> int:
+    crc = 0
+    for byte in data:
+        crc = _CRC8_TABLE[(crc ^ byte) & 0xFF]
+    return crc
+
+
+def _pack_mm(ranges_m) -> np.ndarray:
+    """Metres (float, possibly inf/nan) to uint16 millimetres, 0 = no return."""
+    arr = np.asarray(ranges_m, dtype=np.float64)
+    with np.errstate(invalid="ignore"):
+        valid = np.isfinite(arr) & (arr > 0.0)
+        mm = np.where(valid, arr * 1000.0, 0.0)
+    return np.clip(np.rint(mm), 0, 65535).astype("<u2")
+
+
+class LidarFeed:
+    """Runs a scan source on its own thread and keeps only the newest scan.
+
+    The main loop is paced by the camera, so it cannot also sit in a blocking
+    serial read.  One slot, latest wins: if the loop is busy for 400 ms, the
+    scanner has produced two revolutions and only the second one is worth
+    anything.  ``dropped`` counts the rest, which is how you tell the difference
+    between a slow link and a slow scanner.
+    """
+
+    def __init__(self, source: ScanSource) -> None:
+        self.source = source
+        self._slot: Optional[ScanReading] = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.received = 0
+        self.dropped = 0
+        self.failed = False
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="lidar", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            for reading in self.source.scans():
+                if self._stop.is_set():
+                    break
+                with self._lock:
+                    if self._slot is not None:
+                        self.dropped += 1
+                    self._slot = reading
+                    self.received += 1
+        except Exception:
+            # The camera stream must survive a scanner that was unplugged.
+            self.failed = True
+            log.exception("lidar feed stopped")
+
+    def take(self) -> Optional[ScanReading]:
+        with self._lock:
+            reading, self._slot = self._slot, None
+        return reading
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        try:
+            self.source.close()
+        except Exception:
+            pass
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -252,6 +761,8 @@ class RoboCamClient:
         max_inflight: int = 3,
         on_result: Optional[Callable[[Dict[str, Any]], None]] = None,
         reconnect_after_s: float = 5.0,
+        max_inflight_scans: int = 2,
+        on_scan_result: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.server = server
         self.client_id = client_id
@@ -260,22 +771,38 @@ class RoboCamClient:
         self.max_inflight = max(1, max_inflight)
         self.on_result = on_result
         self.reconnect_after_s = reconnect_after_s
+        # Scans get their own window.  Sharing one with the camera would let a
+        # backlog of frames stop the obstacle data, which is exactly backwards:
+        # if the link is congested, ranges are the part worth keeping.
+        self.max_inflight_scans = max(1, max_inflight_scans)
+        self.on_scan_result = on_scan_result
 
         self.ctx = zmq.Context.instance()
         self.sock: Optional[zmq.Socket] = None
         self._pending: Dict[int, float] = {}   # seq -> monotonic send time
+        self._pending_scans: Dict[int, float] = {}
         self._seq = 0
+        self._scan_seq = 0
         self._stop = False
         self._connected = False
         self._last_rx = time.monotonic()
+        self._lidar_info: Dict[str, Any] = {}
+        # Set from the welcome: a server with lidar.enabled false answers every
+        # scan with an error, so there is no point sending them.
+        self._server_wants_scans = True
 
         # Counters for the periodic status line.
         self.sent = 0
         self.results_ok = 0
         self.results_bad = 0
         self.skipped_backpressure = 0
+        self.scans_sent = 0
+        self.scan_results_ok = 0
+        self.scan_results_bad = 0
+        self.scans_skipped = 0
         self._rtt_sum = 0.0
         self._rtt_n = 0
+        self._last_scan_summary: Dict[str, Any] = {}
 
     # -- connection -------------------------------------------------------
 
@@ -289,6 +816,7 @@ class RoboCamClient:
         self.sock.setsockopt(zmq.LINGER, 0)
         self.sock.connect(self.server)
         self._pending.clear()
+        self._pending_scans.clear()
         self._connected = False
         self._last_rx = time.monotonic()
         log.info("connecting to %s as %r", self.server, self.client_id)
@@ -301,6 +829,7 @@ class RoboCamClient:
             "height": getattr(self, "_src_height", 0),
             "fps": getattr(self, "_src_fps", 0.0),
             "camera": getattr(self, "_src_name", ""),
+            "lidar": self._lidar_info,
             "t_send_ns": time.monotonic_ns(),
         })
 
@@ -323,13 +852,21 @@ class RoboCamClient:
 
     # -- main loop --------------------------------------------------------
 
-    def run(self, source: FrameSource, duration: float = 0.0, status_every: float = 5.0) -> None:
+    def run(self, source: FrameSource, duration: float = 0.0, status_every: float = 5.0,
+            scan_source: Optional[ScanSource] = None) -> None:
         import cv2
 
         self._src_width = source.width
         self._src_height = source.height
         self._src_fps = getattr(source, "fps", 0.0)
         self._src_name = type(source).__name__
+
+        feed: Optional[LidarFeed] = None
+        if scan_source is not None:
+            self._lidar_info = scan_source.info()
+            feed = LidarFeed(scan_source)
+            feed.start()
+            log.info("lidar: %s", ", ".join(f"{k}={v}" for k, v in self._lidar_info.items()))
 
         self.connect()
         t_start = time.monotonic()
@@ -346,6 +883,12 @@ class RoboCamClient:
                 if now - self._last_rx > self.reconnect_after_s:
                     log.warning("no reply for %.1fs, reconnecting", now - self._last_rx)
                     self.connect()
+
+                # Before the frame: a scan is smaller, rarer and more perishable,
+                # and the frame that follows it on the server will be paired with
+                # it rather than with the one before.
+                if feed is not None:
+                    self._pump_lidar(feed)
 
                 if len(self._pending) >= self.max_inflight:
                     # Server is behind. Drop this frame at the source.
@@ -365,8 +908,48 @@ class RoboCamClient:
             self._send({"type": MSG_BYE, "reason": "client shutting down"})
             # Give the goodbye a moment to leave the socket.
             time.sleep(0.05)
+            if feed is not None:
+                feed.stop()
             source.close()
             self.close_socket()
+
+    def _pump_lidar(self, feed: LidarFeed) -> None:
+        """Send the newest revolution, if there is one and the server wants it."""
+        reading = feed.take()
+        if reading is None or not self._server_wants_scans:
+            return
+        if len(self._pending_scans) >= self.max_inflight_scans:
+            self.scans_skipped += 1
+            return
+        self._send_scan(reading)
+
+    def _send_scan(self, reading: ScanReading) -> None:
+        payload = reading.ranges_mm.astype("<u2").tobytes()
+        if reading.intensities is not None:
+            payload += np.asarray(reading.intensities, dtype=np.uint8).tobytes()
+
+        seq = self._scan_seq
+        self._scan_seq += 1
+        header = {
+            "type": MSG_SCAN,
+            "seq": seq,
+            "encoding": SCAN_ENC_U16_MM,
+            "count": int(len(reading)),
+            "angle_min": float(reading.angle_min),
+            "angle_increment": float(reading.angle_increment),
+            "range_min": float(reading.range_min),
+            "range_max": float(reading.range_max),
+            "scan_time": float(reading.scan_time),
+            "intensities": reading.intensities is not None,
+            "source": self._lidar_info.get("model", ""),
+            "t_capture_ns": int(reading.t_capture_ns),
+            "t_send_ns": time.monotonic_ns(),
+        }
+        if self._send(header, payload):
+            self._pending_scans[seq] = time.monotonic()
+            self.scans_sent += 1
+        else:
+            self.scans_skipped += 1
 
     def _send_frame(self, img: Optional[np.ndarray], pre_encoded: Optional[bytes], cv2) -> None:
         t_capture_ns = time.monotonic_ns()
@@ -439,6 +1022,19 @@ class RoboCamClient:
                 log.info("server accepted session %s (processor=%s, host=%s)",
                          header.get("session_id"), header.get("processor"),
                          header.get("server", {}).get("host", "?"))
+                server_lidar = header.get("server", {}).get("lidar", {})
+                # An older server has no opinion on scans; assume it wants them
+                # and let it answer with errors if not.
+                self._server_wants_scans = bool(server_lidar.get("enabled", True))
+                if self._lidar_info and not self._server_wants_scans:
+                    log.warning("server has lidar disabled — not sending scans "
+                                "(start it without --no-lidar to use the LDS-02)")
+                elif self._lidar_info and server_lidar:
+                    log.info("server lidar geometry: yaw %+.0f deg, hfov %.0f deg, "
+                             "scans older than %.0f ms not fused",
+                             server_lidar.get("mount_yaw_deg", 0.0),
+                             server_lidar.get("camera_hfov_deg", 0.0),
+                             server_lidar.get("stale_after_ms", 0.0))
             else:
                 log.error("server rejected session: %s", header.get("message"))
                 self._stop = True
@@ -466,6 +1062,32 @@ class RoboCamClient:
                     log.exception("on_result callback raised")
             return
 
+        if mtype == MSG_SCAN_RESULT:
+            seq = int(header.get("seq", -1))
+            sent_at = self._pending_scans.pop(seq, None)
+            if sent_at is not None:
+                header["rtt_ms"] = round((time.monotonic() - sent_at) * 1000.0, 2)
+            if header.get("ok"):
+                self.scan_results_ok += 1
+                self._last_scan_summary = header.get("data", {}) or {}
+            else:
+                self.scan_results_bad += 1
+                reason = header.get("reason")
+                if reason == "lidar_disabled":
+                    # Stop rather than keep paying to be refused; the operator
+                    # has told the server not to look at scans.
+                    self._server_wants_scans = False
+                    log.warning("server refused a scan: %s", header.get("data", {}).get("error", ""))
+                else:
+                    log.warning("scan seq=%d not ok: %s %s", seq, reason,
+                                header.get("data", {}).get("error", ""))
+            if self.on_scan_result is not None:
+                try:
+                    self.on_scan_result(header)
+                except Exception:
+                    log.exception("on_scan_result callback raised")
+            return
+
         if mtype == MSG_PONG:
             return
         if mtype == MSG_ERROR:
@@ -476,16 +1098,39 @@ class RoboCamClient:
     def _log_status(self, elapsed: float) -> None:
         rtt = self._rtt_sum / self._rtt_n if self._rtt_n else 0.0
         log.info(
-            "sent=%d ok=%d bad=%d skipped=%d | %.1f fps out | rtt %.1f ms | inflight=%d",
+            "sent=%d ok=%d bad=%d skipped=%d | %.1f fps out | rtt %.1f ms | inflight=%d%s",
             self.sent, self.results_ok, self.results_bad, self.skipped_backpressure,
             self.sent / elapsed if elapsed > 0 else 0.0, rtt, len(self._pending),
+            self._lidar_status(elapsed),
         )
         self.sent = 0
         self.results_ok = 0
         self.results_bad = 0
         self.skipped_backpressure = 0
+        self.scans_sent = 0
+        self.scan_results_ok = 0
+        self.scan_results_bad = 0
+        self.scans_skipped = 0
         self._rtt_sum = 0.0
         self._rtt_n = 0
+
+    def _lidar_status(self, elapsed: float) -> str:
+        """The LiDAR half of the status line, empty when there is no scanner."""
+        if not self._lidar_info:
+            return ""
+        rate = self.scans_sent / elapsed if elapsed > 0 else 0.0
+        summary = self._last_scan_summary
+        detail = ""
+        if summary:
+            nearest = summary.get("nearest_m")
+            # The number that says the scanner is really measuring the room, not
+            # just producing traffic.
+            detail = (" nearest %.2f m @%+.0f°" % (nearest, summary.get("nearest_deg", 0.0))
+                      if nearest is not None else " no returns")
+            if summary.get("obstacle"):
+                detail += " OBSTACLE"
+        return (" | lidar %.1f Hz ok=%d bad=%d skipped=%d%s"
+                % (rate, self.scan_results_ok, self.scan_results_bad, self.scans_skipped, detail))
 
     def stop(self) -> None:
         self._stop = True
@@ -499,9 +1144,44 @@ class RoboCamClient:
 def build_source(args) -> FrameSource:
     if args.source == "synthetic":
         return SyntheticSource(args.width, args.height, args.fps)
+    if args.source == "none":
+        return NullSource()
     if args.source == "gst-jpeg":
         return GstJpegSource(args.device, args.width, args.height, args.fps, args.quality)
     return OpenCVSource(args.device, args.width, args.height, args.fps, args.fourcc)
+
+
+def build_scan_source(args) -> Optional[ScanSource]:
+    """Open the LiDAR, or return None if there is not one to open.
+
+    ``auto`` tries ROS 2 then serial and gives up.  It never substitutes the
+    synthetic scanner: a robot acting on invented ranges is worse than a robot
+    that knows it is blind.
+    """
+    mode = args.lidar
+    if mode == "off":
+        return None
+    if mode == "synthetic":
+        return SyntheticScanSource(points=args.lidar_points, hz=args.lidar_hz)
+    if mode == "ros2":
+        return Ros2ScanSource(args.lidar_topic)
+    if mode == "serial":
+        return SerialLdsSource(args.lidar_port, args.lidar_baud, args.lidar_points,
+                               spin=args.lidar_spin, crc=args.lidar_crc)
+
+    errors = []
+    try:
+        return Ros2ScanSource(args.lidar_topic)
+    except Exception as exc:
+        errors.append("ros2: %s" % exc)
+    try:
+        return SerialLdsSource(args.lidar_port, args.lidar_baud, args.lidar_points,
+                               spin=args.lidar_spin, crc=args.lidar_crc)
+    except Exception as exc:
+        errors.append("serial: %s" % exc)
+
+    log.warning("no lidar found, streaming camera only (%s)", "; ".join(errors))
+    return None
 
 
 def main(argv=None) -> int:
@@ -512,9 +1192,9 @@ def main(argv=None) -> int:
     p.add_argument("-s", "--server", default="tcp://10.128.17.196:5555",
                    help="server endpoint (default: %(default)s)")
     p.add_argument("--client-id", default="orin", help="identifies this robot to the server")
-    p.add_argument("--source", choices=["camera", "synthetic", "gst-jpeg"], default="camera",
+    p.add_argument("--source", choices=["camera", "synthetic", "gst-jpeg", "none"], default="camera",
                    help="camera: OpenCV capture; synthetic: test pattern, no camera needed; "
-                        "gst-jpeg: hardware JPEG via GStreamer (Jetson)")
+                        "gst-jpeg: hardware JPEG via GStreamer (Jetson); none: lidar only")
     p.add_argument("--device", default="0", help="/dev/videoN index, path, or GStreamer pipeline")
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
@@ -528,6 +1208,28 @@ def main(argv=None) -> int:
     p.add_argument("--print-results", action="store_true", help="print every result as JSON")
     p.add_argument("--status-every", type=float, default=5.0, help="status line interval, 0 to disable")
     p.add_argument("--log-level", default="INFO")
+
+    lidar = p.add_argument_group(
+        "lidar (LDS-02)",
+        "auto tries ROS 2 then the serial device and gives up if neither is there; "
+        "it never silently substitutes the synthetic scanner",
+    )
+    lidar.add_argument("--lidar", choices=["off", "auto", "ros2", "serial", "synthetic"],
+                       default="off", help="how to read the scanner (default: %(default)s)")
+    lidar.add_argument("--lidar-topic", default="/scan", help="ROS 2 LaserScan topic")
+    lidar.add_argument("--lidar-port", default="/dev/ttyUSB0", help="serial device")
+    lidar.add_argument("--lidar-baud", type=int, default=230400, help="serial baud rate")
+    lidar.add_argument("--lidar-points", type=int, default=360, help="points per revolution")
+    lidar.add_argument("--lidar-spin", choices=["cw", "ccw"], default="cw",
+                       help="direction the device numbers its angles in; flip this if the "
+                            "bird's-eye plot in the server's snapshot is mirrored")
+    lidar.add_argument("--lidar-crc", choices=["auto", "check", "ignore"], default="auto",
+                       help="serial packet checksum handling")
+    lidar.add_argument("--lidar-hz", type=float, default=5.0, help="synthetic scanner rate")
+    lidar.add_argument("--max-inflight-scans", type=int, default=2,
+                       help="scans allowed to be awaiting a result before dropping")
+    lidar.add_argument("--print-scans", action="store_true",
+                       help="print every scan result as JSON")
     args = p.parse_args(argv)
 
     logging.basicConfig(
@@ -540,6 +1242,10 @@ def main(argv=None) -> int:
         if args.print_results:
             print(json.dumps(result, separators=(",", ":")), flush=True)
 
+    def on_scan_result(result: Dict[str, Any]) -> None:
+        if args.print_scans:
+            print(json.dumps(result, separators=(",", ":")), flush=True)
+
     client = RoboCamClient(
         server=args.server,
         client_id=args.client_id,
@@ -547,6 +1253,8 @@ def main(argv=None) -> int:
         jpeg_quality=args.quality,
         max_inflight=args.max_inflight,
         on_result=on_result,
+        max_inflight_scans=args.max_inflight_scans,
+        on_scan_result=on_scan_result,
     )
 
     signal.signal(signal.SIGINT, lambda *_: client.stop())
@@ -558,7 +1266,17 @@ def main(argv=None) -> int:
         log.error("could not open source: %s", exc)
         return 1
 
-    client.run(source, duration=args.duration, status_every=args.status_every)
+    try:
+        scan_source = build_scan_source(args)
+    except Exception as exc:
+        # An explicitly requested scanner that will not open is a failure, not
+        # something to shrug off: the operator asked for ranges.
+        log.error("could not open lidar (%s): %s", args.lidar, exc)
+        source.close()
+        return 1
+
+    client.run(source, duration=args.duration, status_every=args.status_every,
+               scan_source=scan_source)
     return 0
 
 

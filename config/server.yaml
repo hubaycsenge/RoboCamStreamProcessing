@@ -26,12 +26,42 @@ queue:
 processor:
   # "stats"  -> report resolution/shape/rate, no models (current default)
   # "noop"   -> reply immediately, measures the transport ceiling
+  # "fusion" -> stats plus the LiDAR scan projected into the camera's view
   # later: yolo, mast3r, vggt
   name: stats
   workers: 1
   options:
     brightness: true    # mean/std, catches a lens cap or a frozen buffer
     checksum: false     # enable to detect an identical frame being resent
+    lidar: true         # include the scan summary when one is attached
+
+lidar:
+  # The robot's LDS-02: 360 points a revolution, ~5 Hz, 0.12-12 m, one
+  # horizontal plane. Scans arrive on the same socket as the frames and are
+  # answered from the IO thread; the newest one is attached to the next frame
+  # for processors to use.
+  enabled: true
+
+  # --- the two that describe YOUR robot; check them, do not assume ---
+  # Bearing, in the LiDAR's own frame, that the camera looks along. 0 means both
+  # point the same way; 180 means the scanner is mounted backwards.
+  mount_yaw_deg: 0.0
+  # Camera horizontal field of view, used to turn a bearing into an image
+  # column. Wrong here means every fused range lands on the wrong object.
+  camera_hfov_deg: 70.0
+
+  # --- reporting ---
+  sectors: 12         # clearance summary resolution: 12 sectors of 30 degrees
+  obstacle_m: 0.5     # a return closer than this ahead raises data.lidar.obstacle
+  clear_m: 1.0        # a direction is "free" from this range out
+  min_free_deg: 15.0  # narrowest gap reported as a free direction
+  front_deg: 60.0     # width of the arc treated as in front
+  fov_bins: 32        # horizontal slices of the image that get their own range
+
+  # A scan older than this is not attached to a frame. At 5 Hz a scan is up to
+  # 200 ms old before its successor exists, so much below 250 ms means most
+  # frames get no ranges at all; much above it and the robot fuses a stale world.
+  stale_after_ms: 400.0
 
 snapshot:
   # Periodically write a decoded frame to disk so you can confirm from your
@@ -41,6 +71,9 @@ snapshot:
   every_n_frames: 150
   latest_only: true
   jpeg_quality: 85
+  # Draw the scan on the snapshot: bird's-eye plot plus a depth strip aligned to
+  # the image columns. This is how you check mount_yaw_deg without writing code.
+  lidar_overlay: true
 
 logging:
   level: INFO

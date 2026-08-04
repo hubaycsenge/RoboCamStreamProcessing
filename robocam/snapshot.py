@@ -7,7 +7,9 @@ arriving from the robot.
 
 Writes happen on their own thread with a single-slot latest-wins mailbox, so a
 slow filesystem (and sshfs is a slow filesystem) can never add jitter to the IO
-loop.
+loop.  The LiDAR overlay is drawn on that same thread for the same reason: it is
+a few milliseconds of OpenCV per snapshot, which is nothing every 150 frames but
+is not something to put in the path of every frame.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from .decode import encode_jpeg
+from .lidar import Scan
 
 log = logging.getLogger(__name__)
 
@@ -32,14 +35,22 @@ class SnapshotWriter:
         latest_only: bool = True,
         jpeg_quality: int = 85,
         enabled: bool = True,
+        lidar_overlay: bool = True,
+        hfov_deg: float = 70.0,
+        mount_yaw_deg: float = 0.0,
+        fov_bins: int = 32,
     ) -> None:
         self.dir = Path(directory)
         self.every_n = int(every_n_frames)
         self.latest_only = bool(latest_only)
         self.quality = int(jpeg_quality)
         self.enabled = bool(enabled) and self.every_n > 0
+        self.lidar_overlay = bool(lidar_overlay)
+        self.hfov_deg = float(hfov_deg)
+        self.mount_yaw_deg = float(mount_yaw_deg)
+        self.fov_bins = int(fov_bins)
 
-        self._slot: Optional[Tuple[str, int, np.ndarray]] = None
+        self._slot: Optional[Tuple[str, int, np.ndarray, Optional[Scan]]] = None
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -61,16 +72,18 @@ class SnapshotWriter:
             self._thread.join(timeout=timeout)
             self._thread = None
 
-    def maybe_offer(self, session_id: str, seq: int, image: np.ndarray, frame_index: int) -> None:
+    def maybe_offer(self, session_id: str, seq: int, image: np.ndarray, frame_index: int,
+                    scan: Optional[Scan] = None) -> None:
         """Offer a frame; it is written only if it lands on the interval.
 
         Copies the array, because the caller's buffer may be recycled before the
-        writer thread gets to it.
+        writer thread gets to it.  The scan is not copied — the server replaces
+        the whole object on every revolution and never mutates one in place.
         """
         if not self.enabled or frame_index % self.every_n != 0:
             return
         with self._lock:
-            self._slot = (session_id, seq, image.copy())
+            self._slot = (session_id, seq, image.copy(), scan)
         self._wake.set()
 
     def _run(self) -> None:
@@ -82,8 +95,20 @@ class SnapshotWriter:
                 self._slot = None
             if item is None:
                 continue
-            session_id, seq, image = item
+            session_id, seq, image, scan = item
             try:
+                if scan is not None and self.lidar_overlay:
+                    try:
+                        from .overlay import draw_scan
+
+                        image = draw_scan(image, scan, hfov_deg=self.hfov_deg,
+                                          mount_yaw_deg=self.mount_yaw_deg,
+                                          bins=self.fov_bins)
+                    except Exception:
+                        # A snapshot without the overlay is still worth having;
+                        # losing the frame dump because a drawing call objected
+                        # to some geometry would be the wrong trade.
+                        log.exception("lidar overlay failed for seq=%d", seq)
                 blob = encode_jpeg(image, self.quality)
                 if blob is None:
                     log.warning("snapshot encode failed for seq=%d", seq)

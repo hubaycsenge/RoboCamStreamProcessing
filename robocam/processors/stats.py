@@ -28,21 +28,31 @@ class StatsProcessor(Processor):
     checksum:
         Include a cheap hash of the pixel data.  Useful for spotting a stream
         that is re-sending one identical frame.
+    lidar:
+        Include the summary of the scan attached to the frame, when there is
+        one.  Free — the server computed it on the IO thread — and it answers
+        "is the LiDAR arriving too?" from the same result line that answers the
+        question for the camera.  Use the ``fusion`` processor for anything that
+        relates the ranges to the image.
     """
 
     name = "stats"
 
-    def __init__(self, brightness: bool = True, checksum: bool = False, **options: Any) -> None:
-        super().__init__(brightness=brightness, checksum=checksum, **options)
+    def __init__(self, brightness: bool = True, checksum: bool = False,
+                 lidar: bool = True, **options: Any) -> None:
+        super().__init__(brightness=brightness, checksum=checksum, lidar=lidar, **options)
         self.brightness = bool(brightness)
         self.checksum = bool(checksum)
+        self.lidar = bool(lidar)
         self._count = 0
+        self._scans = 0
         self._first_ts: Optional[float] = None
         self._last_ts: Optional[float] = None
         self._last_interval_ms = 0.0
 
     def setup(self) -> None:
         self._count = 0
+        self._scans = 0
         self._first_ts = None
         self._last_ts = None
 
@@ -87,5 +97,22 @@ class StatsProcessor(Processor):
         if self.checksum:
             # Not cryptographic, just enough to notice a repeated frame.
             data["checksum"] = format(int(np.sum(img[::8, ::8].astype(np.int64))) & 0xFFFFFFFF, "08x")
+
+        if self.lidar:
+            if frame.scan is None:
+                # An explicit None, not a missing key: the difference between
+                # "no scanner on this robot" and "this processor forgot to look"
+                # is exactly what you are debugging when you read this field.
+                data["lidar"] = None
+            else:
+                self._scans += 1
+                data["lidar"] = dict(frame.scan.summary)
+                data["lidar"]["scan_seq"] = frame.scan.seq
+                data["lidar"]["age_ms"] = round(frame.scan_age_ms, 1)
+                # How often a frame arrives with ranges to go with it.  Well
+                # below 1.0 is expected — the LiDAR runs at a sixth of the
+                # camera's rate — but near 0.0 means the pairing window in
+                # lidar.stale_after_ms is too tight for the scanner's speed.
+                data["scan_fraction"] = round(self._scans / self._count, 3)
 
         return data

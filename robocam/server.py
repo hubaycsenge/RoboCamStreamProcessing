@@ -7,6 +7,15 @@ expensive happens in the worker pool (see pipeline.py).
 ZeroMQ sockets are not thread-safe, so results travel from the workers to the
 IO thread through a plain ``queue.Queue`` which the IO loop drains after every
 poll.  That keeps all socket calls on one thread without any locking.
+
+LiDAR is the one exception to "the IO thread does nothing slow", and only
+because the work is genuinely tiny: parsing 360 uint16s and reducing them to
+sector minima is ~60 µs, against a 20 ms poll.  Scans are answered inline so
+that obstacle information is never stuck behind a model in the frame queue —
+at 5 Hz, queueing a scan behind two 30 ms frames would be most of its useful
+life.  The last scan is also held on the session and attached to the next frame,
+which is where camera/LiDAR fusion happens: association by arrival time on the
+server's own clock, rather than by two unrelated client clocks.
 """
 
 from __future__ import annotations
@@ -21,10 +30,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import zmq
 
+from . import lidar as lidar_mod
 from . import processors, wire
 from .config import Config
 from .decode import DecodeError, SessionDecoder
@@ -69,8 +79,34 @@ class Session:
     decoder: SessionDecoder = field(default_factory=SessionDecoder)
     greeted: bool = False
 
+    # -- LiDAR ------------------------------------------------------------
+    # What the client declared in its hello, if anything.
+    lidar_info: Dict[str, Any] = field(default_factory=dict)
+    scans_received: int = 0
+    scans_failed: int = 0
+    # Latest good scan, kept for attaching to frames.  One slot, latest wins:
+    # an older scan has no value once a newer one exists.
+    last_scan: Optional[lidar_mod.Scan] = None
+    last_scan_ns: int = 0
+    # Interval between the last two scans, for the reported rate.  A device
+    # spinning below its rated speed shows up here before it shows up in the
+    # ranges, so it is worth carrying.
+    scan_interval_ms: float = 0.0
+
     def touch(self) -> None:
         self.last_seen_ns = wire.monotonic_ns()
+
+    def scan_hz(self) -> float:
+        return 1000.0 / self.scan_interval_ms if self.scan_interval_ms > 0 else 0.0
+
+    def fresh_scan(self, stale_after_ms: float) -> Tuple[Optional[lidar_mod.Scan], float]:
+        """The last scan and its age, or (None, 0) if there is none or it is stale."""
+        if self.last_scan is None:
+            return None, 0.0
+        age_ms = (wire.monotonic_ns() - self.last_scan_ns) / 1e6
+        if stale_after_ms > 0 and age_ms > stale_after_ms:
+            return None, age_ms
+        return self.last_scan, age_ms
 
     def age_s(self) -> float:
         return (wire.monotonic_ns() - self.created_ns) / 1e9
@@ -99,6 +135,10 @@ class StreamServer:
             latest_only=config.snapshot.latest_only,
             jpeg_quality=config.snapshot.jpeg_quality,
             enabled=config.snapshot.enabled,
+            lidar_overlay=config.snapshot.lidar_overlay and config.lidar.enabled,
+            hfov_deg=config.lidar.camera_hfov_deg,
+            mount_yaw_deg=config.lidar.mount_yaw_deg,
+            fov_bins=config.lidar.fov_bins,
         )
 
         self._stop = threading.Event()
@@ -109,6 +149,8 @@ class StreamServer:
         self._stat_bytes = 0
         self._stat_dropped = 0
         self._stat_latency_ms = 0.0
+        self._stat_scans = 0
+        self._stat_scan_bytes = 0
 
     # -- lifecycle --------------------------------------------------------
 
@@ -128,8 +170,16 @@ class StreamServer:
 
         name = self.cfg.processor.name
         options = dict(self.cfg.processor.options)
+
+        def build_processor():
+            # Each worker gets its own instance; each is told where the scanner
+            # points before it sees a frame.
+            processor = processors.build(name, options)
+            processor.configure(self.cfg.lidar)
+            return processor
+
         self.pool = WorkerPool(
-            processor_factory=lambda: processors.build(name, options),
+            processor_factory=build_processor,
             frame_queue=self.frames,
             result_queue=self.results,
             workers=self.cfg.processor.workers,
@@ -139,12 +189,18 @@ class StreamServer:
         self.pool.start()
 
         log.info(
-            "listening on %s | processor=%s workers=%d | queue depth=%d drop=%s",
+            "listening on %s | processor=%s workers=%d | queue depth=%d drop=%s | lidar=%s",
             self.cfg.server.bind,
             name,
             self.cfg.processor.workers,
             self.cfg.queue.max_depth,
             self.cfg.queue.drop_policy,
+            (
+                f"on (yaw {self.cfg.lidar.mount_yaw_deg:+.0f}°, "
+                f"hfov {self.cfg.lidar.camera_hfov_deg:.0f}°, "
+                f"stale >{self.cfg.lidar.stale_after_ms:.0f} ms)"
+                if self.cfg.lidar.enabled else "off"
+            ),
         )
         for addr in _local_addresses():
             port = self.cfg.server.bind.rsplit(":", 1)[-1]
@@ -241,6 +297,8 @@ class StreamServer:
 
         if msg_type == wire.MSG_FRAME:
             self._on_frame(session, header, payload, recv_ts_ns)
+        elif msg_type == wire.MSG_SCAN:
+            self._on_scan(session, header, payload, recv_ts_ns)
         elif msg_type == wire.MSG_PING:
             self._send(identity, wire.pong(header.get("nonce", 0), header.get("t_send_ns")))
         elif msg_type == wire.MSG_BYE:
@@ -289,7 +347,7 @@ class StreamServer:
             return
 
         log.info(
-            "session %s connected | client=%s camera=%s codec=%s %dx%d @%.1f fps",
+            "session %s connected | client=%s camera=%s codec=%s %dx%d @%.1f fps | lidar=%s",
             session.session_id,
             session.client_id,
             session.camera or "-",
@@ -297,6 +355,7 @@ class StreamServer:
             session.declared_width,
             session.declared_height,
             session.declared_fps,
+            _describe_lidar(session.lidar_info),
         )
         self._send(
             identity,
@@ -310,6 +369,16 @@ class StreamServer:
                     "queue_depth": self.cfg.queue.max_depth,
                     "workers": self.cfg.processor.workers,
                     "processors_available": processors.available(),
+                    # The client checks this before starting its scanner thread:
+                    # streaming scans at a server that discards them wastes the
+                    # robot's CPU and hides the misconfiguration.
+                    "lidar": {
+                        "enabled": self.cfg.lidar.enabled,
+                        "encodings": list(wire.SUPPORTED_SCAN_ENCODINGS),
+                        "mount_yaw_deg": self.cfg.lidar.mount_yaw_deg,
+                        "camera_hfov_deg": self.cfg.lidar.camera_hfov_deg,
+                        "stale_after_ms": self.cfg.lidar.stale_after_ms,
+                    },
                 },
                 echo_t_send_ns=header.get("t_send_ns"),
             ),
@@ -328,6 +397,7 @@ class StreamServer:
             declared_height=int(header.get("height", 0) or 0),
             declared_fps=float(header.get("fps", 0) or 0),
             camera=str(header.get("camera", "")),
+            lidar_info=dict(header.get("lidar") or {}),
         )
         self.sessions[identity] = session
         return session
@@ -337,11 +407,14 @@ class StreamServer:
         if session is not None:
             session.decoder.close()
             log.info(
-                "session %s closed | %d frames, %d dropped, %d failed, %.1f MB, %.0fs",
+                "session %s closed | %d frames, %d dropped, %d failed, "
+                "%d scans (%d bad), %.1f MB, %.0fs",
                 session.session_id,
                 session.frames_received,
                 session.frames_dropped,
                 session.frames_failed,
+                session.scans_received,
+                session.scans_failed,
                 session.bytes_received / 1e6,
                 session.age_s(),
             )
@@ -384,8 +457,15 @@ class StreamServer:
             return
         decode_ms = (time.perf_counter() - t0) * 1000.0
 
+        # Pair the frame with the most recent scan, if there is one recent
+        # enough to still describe the same world.  Association is by arrival on
+        # the server's clock: the two sensors timestamp on the robot's clock but
+        # travel independently, and at 5 Hz the scan's own age dominates
+        # anything the transport adds.
+        scan, scan_age_ms = session.fresh_scan(self.cfg.lidar.stale_after_ms)
+
         self._frame_counter += 1
-        self.snapshots.maybe_offer(session.session_id, seq, image, self._frame_counter)
+        self.snapshots.maybe_offer(session.session_id, seq, image, self._frame_counter, scan=scan)
 
         frame = Frame(
             seq=seq,
@@ -395,11 +475,90 @@ class StreamServer:
             recv_ts_ns=recv_ts_ns,
             decode_ms=decode_ms,
             payload_bytes=len(payload),
+            scan=scan,
+            scan_age_ms=scan_age_ms if scan is not None else 0.0,
         )
         for evicted in self.frames.put(frame):
             session.frames_dropped += 1
             self._stat_dropped += 1
             self._send_dropped(session, evicted)
+
+    # -- LiDAR path -------------------------------------------------------
+
+    def _on_scan(self, session: Session, header: Dict[str, Any], payload: bytes, recv_ts_ns: int) -> None:
+        """Parse, analyse and answer one revolution, all on the IO thread.
+
+        Every scan gets exactly one reply for the same reason every frame does:
+        the client sizes its in-flight window from outstanding replies, so a
+        silently dropped scan would stall the LiDAR stream and nothing else.
+        """
+        seq = int(header.get("seq", -1))
+        cfg = self.cfg.lidar
+
+        if not cfg.enabled:
+            self._send(session.identity, wire.scan_result(
+                seq=seq, ok=False, reason=wire.REASON_LIDAR_DISABLED,
+                payload_bytes=len(payload),
+                encoding=str(header.get("encoding", "")),
+                server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+                data={"error": "server has lidar.enabled: false"},
+                t_capture_ns=header.get("t_capture_ns"),
+                t_send_ns=header.get("t_send_ns"),
+            ))
+            return
+
+        session.scans_received += 1
+        session.bytes_received += len(payload)
+        self._stat_scans += 1
+        self._stat_scan_bytes += len(payload)
+
+        t0 = time.perf_counter()
+        try:
+            scan = lidar_mod.decode_scan(header, payload, recv_ts_ns=recv_ts_ns)
+        except lidar_mod.ScanError as exc:
+            session.scans_failed += 1
+            log.warning("session %s: scan seq=%d rejected: %s", session.session_id, seq, exc)
+            self._send(session.identity, wire.scan_result(
+                seq=seq, ok=False, reason=wire.REASON_BAD_SCAN,
+                payload_bytes=len(payload),
+                encoding=str(header.get("encoding", "")),
+                parse_ms=(time.perf_counter() - t0) * 1000.0,
+                server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+                data={"error": str(exc)},
+                t_capture_ns=header.get("t_capture_ns"),
+                t_send_ns=header.get("t_send_ns"),
+            ))
+            return
+
+        if session.last_scan_ns:
+            session.scan_interval_ms = (recv_ts_ns - session.last_scan_ns) / 1e6
+
+        scan.summary = lidar_mod.analyse(
+            scan,
+            sectors=cfg.sectors,
+            obstacle_m=cfg.obstacle_m,
+            clear_m=cfg.clear_m,
+            front_deg=cfg.front_deg,
+            min_free_deg=cfg.min_free_deg,
+            mount_yaw_deg=cfg.mount_yaw_deg,
+            hz=session.scan_hz(),
+        )
+        parse_ms = (time.perf_counter() - t0) * 1000.0
+
+        session.last_scan = scan
+        session.last_scan_ns = recv_ts_ns
+
+        self._send(session.identity, wire.scan_result(
+            seq=seq, ok=True, reason=wire.REASON_OK,
+            points=scan.count,
+            payload_bytes=len(payload),
+            encoding=str(header.get("encoding", "")),
+            parse_ms=parse_ms,
+            server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+            data=scan.summary,
+            t_capture_ns=header.get("t_capture_ns"),
+            t_send_ns=header.get("t_send_ns"),
+        ))
 
     # -- send path --------------------------------------------------------
 
@@ -443,6 +602,8 @@ class StreamServer:
             data=item.data,
             t_capture_ns=frame.header.get("t_capture_ns"),
             t_send_ns=frame.header.get("t_send_ns"),
+            scan_seq=frame.scan.seq if frame.scan is not None else None,
+            scan_age_ms=frame.scan_age_ms if frame.scan is not None else None,
         )
         self._send(session.identity, header)
 
@@ -533,13 +694,17 @@ class StreamServer:
         if elapsed < interval:
             return
 
-        if self._stat_frames:
+        if self._stat_frames or self._stat_scans:
             fps = self._stat_frames / elapsed
-            mbps = (self._stat_bytes * 8) / elapsed / 1e6
+            mbps = ((self._stat_bytes + self._stat_scan_bytes) * 8) / elapsed / 1e6
             avg_ms = self._stat_latency_ms / max(self._stat_frames, 1)
             log.info(
-                "%.1f fps | %.1f Mbit/s | %.1f ms server-side | %d dropped | %d session(s) | queue=%d",
-                fps, mbps, avg_ms, self._stat_dropped, len(self.sessions), len(self.frames),
+                "%.1f fps | %.1f scans/s%s | %.1f Mbit/s | %.1f ms server-side | "
+                "%d dropped | %d session(s) | queue=%d",
+                fps,
+                self._stat_scans / elapsed,
+                self._nearest_obstacle_note(),
+                mbps, avg_ms, self._stat_dropped, len(self.sessions), len(self.frames),
             )
         elif self.sessions:
             log.info("no frames in %.0fs | %d session(s) idle", elapsed, len(self.sessions))
@@ -549,6 +714,41 @@ class StreamServer:
         self._stat_bytes = 0
         self._stat_dropped = 0
         self._stat_latency_ms = 0.0
+        self._stat_scans = 0
+        self._stat_scan_bytes = 0
+
+    def _nearest_obstacle_note(self) -> str:
+        """The closest thing any session can currently see, for the stats line.
+
+        Worth a few characters of log: it is the one number that tells you at a
+        glance whether the LiDAR is producing plausible measurements or just
+        producing messages.
+        """
+        best = None
+        for session in self.sessions.values():
+            summary = session.last_scan.summary if session.last_scan is not None else None
+            if not summary or summary.get("nearest_m") is None:
+                continue
+            if best is None or summary["nearest_m"] < best[0]:
+                best = (summary["nearest_m"], summary.get("nearest_deg", 0.0))
+        if best is None:
+            return ""
+        return f" | nearest {best[0]:.2f} m @{best[1]:+.0f}°"
+
+
+def _describe_lidar(info: Dict[str, Any]) -> str:
+    """One-line summary of what a client said about its scanner."""
+    if not info:
+        return "none declared"
+    model = info.get("model") or info.get("source") or "?"
+    points = info.get("points")
+    hz = info.get("hz")
+    parts = [str(model)]
+    if points:
+        parts.append(f"{points} pts")
+    if hz:
+        parts.append(f"{float(hz):.1f} Hz")
+    return " ".join(parts)
 
 
 def _local_addresses() -> List[str]:
@@ -587,6 +787,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=None, help="override processor.workers")
     p.add_argument("--queue-depth", type=int, default=None, help="override queue.max_depth")
     p.add_argument("--no-snapshots", action="store_true", help="disable periodic frame dumps")
+    p.add_argument("--no-lidar", action="store_true",
+                   help="ignore scan messages (the robot is told, and stops sending)")
+    p.add_argument("--mount-yaw", type=float, default=None,
+                   help="override lidar.mount_yaw_deg: bearing the camera looks along")
+    p.add_argument("--hfov", type=float, default=None,
+                   help="override lidar.camera_hfov_deg, used to map bearings to columns")
     p.add_argument("--log-level", default=None, help="DEBUG, INFO, WARNING, ERROR")
     p.add_argument("--list-processors", action="store_true", help="print registered processors and exit")
     return p
@@ -611,6 +817,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg.queue.max_depth = args.queue_depth
     if args.no_snapshots:
         cfg.snapshot.enabled = False
+    if args.no_lidar:
+        cfg.lidar.enabled = False
+    if args.mount_yaw is not None:
+        cfg.lidar.mount_yaw_deg = args.mount_yaw
+    if args.hfov is not None:
+        cfg.lidar.camera_hfov_deg = args.hfov
     if args.log_level:
         cfg.logging.level = args.log_level
 
