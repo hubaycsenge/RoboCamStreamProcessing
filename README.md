@@ -102,10 +102,15 @@ LiDAR flags (the robot's LDS-02, streamed alongside the frames):
 ```bash
 --lidar auto                # ros2 topic first, then the serial device; off by default
 --lidar-port /dev/tb3_lidar # default: the udev symlink, not a raw ttyUSBn
+--lidar-baud 115200         # the LDS-02 rate; LD06/LD19 are 230400
 --lidar-topic /scan         # for --lidar ros2
 --lidar-health-every 5      # seconds between progress reports, 0 to silence
 --print-scans               # dump every scan result as JSON
 ```
+
+**`--lidar` is `off` unless you ask for it.** The client streams camera only by
+default, which is why a working `ld08_driver` on the robot does not by itself put
+scans on the wire — the two are unrelated consumers of the same sensor.
 
 `--lidar-port` defaults to `/dev/tb3_lidar` and falls back to `/dev/ld08_lidar`
 — the two names the udev rule has used for the scanner's CP2102 bridge on this
@@ -166,12 +171,23 @@ lidar: /dev/tb3_lidar — no scan yet after 5.0s. not one byte has arrived. The 
   opened, so the device node is real, but nothing is transmitting: check the
   scanner's power lead and that the rotor is actually spinning.
 
-lidar: /dev/tb3_lidar — no scan yet after 5.0s. 3200 bytes arrived but not one valid
-  LD08 packet was framed. That is what a baud mismatch looks like.
+lidar: /dev/tb3_lidar — no scan yet after 5.0s. 67072 bytes arrived (13414 B/s) but
+  not one valid LD08 packet was framed, reading at 230400 baud. An LDS-02 sends
+  about 7050 B/s, so this is ~1.9x too much — the signature of reading faster than
+  the device transmits. Try `--lidar-baud 115200`.
 
 lidar: /dev/tb3_lidar — first revolution after 0.4s, 358/360 points (99% coverage)
 lidar: /dev/tb3_lidar — 27 revolutions, 5.4/s, 359/360 points (100% coverage)
 ```
+
+That middle case is worth dwelling on, because it is the one that looks like a
+dead scanner and is not. The LDS-02 contains an LD08, which shares its *packet
+format* with the LD06 and LD19 but not their baud: those run at 230400 and the
+LD08 at **115200**. Point a 230400 reader at it and every bit gets sampled
+twice — bytes arrive steadily, at roughly double the true rate, and not one of
+them frames. The rate is the clue, so the client compares what it is receiving
+against what an LDS-02 should send and names a baud to try rather than just
+reporting the symptom.
 
 A port that will not open says which fix applies — missing udev rule, missing
 `dialout` group, or a busy port (usually `ld08_driver` already holding it) — and

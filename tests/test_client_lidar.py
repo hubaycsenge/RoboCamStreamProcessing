@@ -164,6 +164,114 @@ def test_serial_source_ignores_a_header_pattern_inside_the_data(fake_serial):
     assert int((reading.ranges_mm > 0).sum()) >= 300
 
 
+# -- diagnosing a stream that never frames ----------------------------------
+#
+# The case that cost an afternoon: right port, right device, right packet
+# format, wrong baud.  The LDS-02's LD08 runs at 115200 while the LD06 and LD19
+# it shares a packet layout with run at 230400, so a reader left at 230400
+# samples every bit twice — bytes arrive steadily, at roughly double the true
+# rate, and not one of them frames.  "Bytes but no packets" alone cannot say
+# which way to move; the byte *rate* can, and that is what these pin.
+
+
+def _no_frame_message(fake_serial, baud: int, byte_rate: float, waited_s: float = 5.0) -> str:
+    fake_serial(b"\x00" * 64)
+    source = robocam_client.SerialLdsSource(port="/dev/fake", baud=baud)
+    source._bytes = int(byte_rate * waited_s)
+    return source._diagnose(waited_s)
+
+
+def test_default_baud_is_the_lds02_rate():
+    """The one number that decides whether the serial path works at all."""
+    assert robocam_client.LDS02_BAUD == 115200
+    import inspect
+
+    signature = inspect.signature(robocam_client.SerialLdsSource.__init__)
+    assert signature.parameters["baud"].default == robocam_client.LDS02_BAUD
+
+
+def test_too_many_bytes_names_the_lower_baud_to_try(fake_serial):
+    """Reading at 230400 what is sent at 115200: ~2x the bytes, none of them framing."""
+    message = _no_frame_message(fake_serial, baud=230400, byte_rate=13414.0)
+
+    assert "115200" in message
+    assert "--lidar-baud 115200" in message
+    assert "1.9x" in message
+
+
+def test_too_few_bytes_names_the_higher_baud_to_try(fake_serial):
+    message = _no_frame_message(fake_serial, baud=115200, byte_rate=1500.0)
+
+    assert "--lidar-baud 230400" in message
+
+
+def test_a_plausible_rate_that_never_frames_blames_the_device_not_the_baud(fake_serial):
+    """Right rate, wrong bytes — the baud is fine and something else is on the port."""
+    message = _no_frame_message(
+        fake_serial, baud=robocam_client.LDS02_BAUD,
+        byte_rate=robocam_client.SerialLdsSource.EXPECTED_BYTES_PER_S,
+    )
+
+    assert "--lidar-baud" not in message
+    assert "by-id" in message
+
+
+def test_expected_byte_rate_matches_the_packet_layout():
+    """Guards the constant against a change to the packet size or point count."""
+    # 360 points a revolution, 12 to a 47-byte packet, 5 revolutions a second.
+    assert robocam_client.SerialLdsSource.EXPECTED_BYTES_PER_S == pytest.approx(7050.0)
+
+
+# -- shutdown ---------------------------------------------------------------
+
+
+def test_feed_stops_the_reader_before_closing_the_device(fake_serial):
+    """Closing under a blocked read is what made every Ctrl-C print a traceback."""
+    fake_serial(revolution_bytes())
+    source = robocam_client.SerialLdsSource(port="/dev/fake")
+    order = []
+    source._ser.close = lambda: order.append("close")
+    original = source.request_stop
+    source.request_stop = lambda: (order.append("request_stop"), original())
+
+    feed = robocam_client.LidarFeed(source)
+    feed.start()
+    feed.stop(timeout=5.0)
+
+    assert order == ["request_stop", "close"]
+    assert not feed.failed, "a clean shutdown must not mark the feed as failed"
+
+
+def test_feed_does_not_report_a_shutdown_error_as_a_failure(fake_serial, caplog):
+    """A source that raises on the way out during stop() is noise, not a fault."""
+    fake_serial(revolution_bytes())
+    source = robocam_client.SerialLdsSource(port="/dev/fake")
+
+    def explode(_size):
+        raise TypeError("'NoneType' object cannot be interpreted as an integer")
+
+    feed = robocam_client.LidarFeed(source)
+    feed._stop.set()                    # as stop() would have done
+    source._ser.read = explode
+    feed._run()                         # synchronous, so the exception lands here
+
+    assert not feed.failed
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+
+def test_feed_still_reports_a_genuine_failure(fake_serial, caplog):
+    """The unplugged-scanner path must keep shouting."""
+    fake_serial(revolution_bytes())
+    source = robocam_client.SerialLdsSource(port="/dev/fake")
+    source._ser.read = lambda _size: (_ for _ in ()).throw(OSError("device disconnected"))
+
+    feed = robocam_client.LidarFeed(source)
+    feed._run()
+
+    assert feed.failed
+    assert [r for r in caplog.records if r.levelname == "ERROR"]
+
+
 # -- the synthetic scanner --------------------------------------------------
 
 
@@ -185,7 +293,7 @@ def test_synthetic_scan_is_never_chosen_automatically():
     """A robot must never act on invented ranges because a device was missing."""
     args = type("Args", (), {
         "lidar": "auto", "lidar_topic": "/nope", "lidar_port": "/dev/does-not-exist",
-        "lidar_baud": 230400, "lidar_points": 360, "lidar_spin": "cw",
+        "lidar_baud": robocam_client.LDS02_BAUD, "lidar_points": 360, "lidar_spin": "cw",
         "lidar_crc": "auto", "lidar_hz": 5.0,
     })()
     assert robocam_client.build_scan_source(args) is None

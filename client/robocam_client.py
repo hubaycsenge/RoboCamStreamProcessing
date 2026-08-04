@@ -282,7 +282,7 @@ class NullSource(FrameSource):
 #             by ld08_driver.  Use this if ROS is running; it is the one that
 #             keeps working when someone re-mounts the scanner and updates the
 #             URDF instead of telling you.
-#   serial  — talk to the device directly over its USB serial link (230400
+#   serial  — talk to the device directly over its USB serial link (115200
 #             baud, the LD08/LD19 packet format).  Use this if there is no ROS
 #             on the robot, or to take the scanner away from ROS entirely.
 #
@@ -309,6 +309,13 @@ class NullSource(FrameSource):
 #: only ever used when ``--lidar-port`` names one explicitly.
 LIDAR_PORT_ALIASES = ("/dev/tb3_lidar", "/dev/ld08_lidar")
 DEFAULT_LIDAR_PORT = LIDAR_PORT_ALIASES[0]
+
+#: The LDS-02's line rate.  The LD08 inside it shares the LD06/LD19 *packet
+#: format* but not their baud — those run at 230400 and the LD08 at 115200 — and
+#: the two are easy to conflate because every other detail matches.  Reading at
+#: 230400 samples every bit twice: bytes arrive steadily, at roughly double the
+#: true rate, and not one of them frames.  See :meth:`SerialLdsSource._explain_no_frames`.
+LDS02_BAUD = 115200
 
 
 class LidarUnavailable(RuntimeError):
@@ -481,6 +488,16 @@ class ScanSource:
     def scans(self) -> Iterator[ScanReading]:
         raise NotImplementedError
 
+    def request_stop(self) -> None:
+        """Ask :meth:`scans` to return at its next opportunity.
+
+        Separate from :meth:`close` because the reader is a *thread* sitting in
+        a blocking read: closing the device out from under it raises inside
+        somebody else's library, which reads as a crash in the log even though
+        the process was only shutting down.  Asking first and closing after the
+        thread has left is the difference between a clean exit and a traceback.
+        """
+
     def close(self) -> None:
         pass
 
@@ -503,10 +520,14 @@ class SyntheticScanSource(ScanSource):
         self.hz = float(hz)
         self.room = room
         self.range_min, self.range_max = 0.12, 12.0
+        self._stopping = False
 
     def info(self) -> Dict[str, Any]:
         return {"model": self.model, "points": self.points, "hz": self.hz,
                 "note": "SYNTHETIC — not a real sensor"}
+
+    def request_stop(self) -> None:
+        self._stopping = True
 
     def scans(self) -> Iterator[ScanReading]:
         period = 1.0 / self.hz if self.hz > 0 else 0.2
@@ -515,7 +536,7 @@ class SyntheticScanSource(ScanSource):
         xmin, xmax, ymin, ymax = self.room
         i = 0
 
-        while True:
+        while not self._stopping:
             t0 = time.perf_counter()
             # Distance to the walls of an axis-aligned box, from inside it.
             t = np.full(self.points, np.inf)
@@ -580,6 +601,7 @@ class Ros2ScanSource(ScanSource):
         self._slot: Optional[Any] = None
         self._lock = threading.Lock()
         self._new = threading.Event()
+        self._stopping = False
         self._topic = topic
         self._timeout_s = timeout_s
         self._sub = self._node.create_subscription(LaserScan, topic, self._on_msg, qos)
@@ -631,13 +653,16 @@ class Ros2ScanSource(ScanSource):
     def info(self) -> Dict[str, Any]:
         return {"model": self.model, "topic": self._topic, "transport": "ros2"}
 
+    def request_stop(self) -> None:
+        self._stopping = True
+
     def _on_msg(self, msg) -> None:
         with self._lock:
             self._slot = msg
         self._new.set()
 
     def scans(self) -> Iterator[ScanReading]:
-        while True:
+        while not self._stopping:
             self._rclpy.spin_once(self._node, timeout_sec=0.05)
             self._health.tick()
             if not self._new.is_set():
@@ -672,13 +697,17 @@ class Ros2ScanSource(ScanSource):
 class SerialLdsSource(ScanSource):
     """The LDS-02 over its USB serial link, no ROS involved.
 
-    The device streams 47-byte packets at 230400 baud, each carrying 12 points
+    The device streams 47-byte packets at 115200 baud, each carrying 12 points
     with a start and end angle to interpolate between (the LD08/LD19 format that
     the LDS-02 uses).  Points are accumulated into a fixed 360-bin table and a
     revolution is emitted when the angle wraps past zero.
 
-    Two details worth knowing before you debug this against hardware:
+    Three details worth knowing before you debug this against hardware:
 
+    * **Baud.** :data:`LDS02_BAUD`, 115200 — *not* the 230400 that LD06 and LD19
+      use, though all three speak the same packets.  At the wrong rate the port
+      opens, bytes flow steadily, and nothing ever frames; ``--lidar-baud`` is
+      the knob and :meth:`_explain_no_frames` works out which way to turn it.
     * **Spin direction.** The device numbers its angles in the direction it
       turns, which is clockwise seen from above, while ``LaserScan`` and this
       protocol are counter-clockwise-positive.  That is expressed as a negative
@@ -700,12 +729,18 @@ class SerialLdsSource(ScanSource):
     POINTS_PER_PACKET = 12
     PACKET_BYTES = 47
 
-    def __init__(self, port: str = DEFAULT_LIDAR_PORT, baud: int = 230400, points: int = 360,
+    #: What one revolution costs on the wire: 360 points, 12 to a 47-byte packet,
+    #: at the scanner's nominal 5 Hz.  Only used to judge an observed byte rate,
+    #: so the nominal figure is close enough.
+    EXPECTED_BYTES_PER_S = PACKET_BYTES * (360 / POINTS_PER_PACKET) * 5.0
+
+    def __init__(self, port: str = DEFAULT_LIDAR_PORT, baud: int = LDS02_BAUD, points: int = 360,
                  spin: str = "cw", crc: str = "auto", timeout: float = 1.0,
                  health_every: float = 5.0) -> None:
         import serial  # pyserial
 
         self.baud = int(baud)
+        self._stopping = False
         self.points = int(points)
         self.spin = spin
         self.crc_mode = crc
@@ -768,17 +803,49 @@ class SerialLdsSource(ScanSource):
                     f"rotor is actually spinning. A {self.port} that points at some other "
                     f"device looks exactly like this too.")
         if self._packet_count == 0:
-            return (f"{self._bytes} bytes arrived but not one valid LD08 packet was framed. "
-                    f"That is what a baud mismatch looks like — this is reading at {self.baud} "
-                    f"— and also what a non-LDS-02 device on this port looks like.")
+            return self._explain_no_frames(waited_s)
         return (f"{self._bytes} bytes and {self._packet_count} packets parsed, but no complete "
                 f"revolution yet. Normal for the first second while the rotor comes up to "
                 f"speed; if it persists, fewer than a quarter of the {self.points} bins are "
                 f"filling, so most beams are returning nothing.")
 
+    def _explain_no_frames(self, waited_s: float) -> str:
+        """Bytes arrive and none of them frame — which way is the baud wrong?
+
+        The observed byte rate answers that, because a UART reading faster than
+        its transmitter samples every bit more than once and inflates the byte
+        count by the ratio of the two rates, while one reading too slowly drops
+        most of them.  So the rate relative to
+        :data:`EXPECTED_BYTES_PER_S` says which direction to move, and naming a
+        rate to try beats naming the symptom.
+        """
+        rate = self._bytes / waited_s if waited_s > 0 else 0.0
+        ratio = rate / self.EXPECTED_BYTES_PER_S
+        other = 230400 if self.baud == LDS02_BAUD else LDS02_BAUD
+        head = (f"{self._bytes} bytes arrived ({rate:.0f} B/s) but not one valid LD08 packet "
+                f"was framed, reading at {self.baud} baud.")
+
+        if ratio >= 1.5:
+            return (f"{head} An LDS-02 sends about {self.EXPECTED_BYTES_PER_S:.0f} B/s, so this "
+                    f"is ~{ratio:.1f}x too much — the signature of reading faster than the "
+                    f"device transmits. Try `--lidar-baud {other}`. (The LDS-02 is "
+                    f"{LDS02_BAUD}; LD06 and LD19 are 230400 and are easy to confuse with it.)")
+        if ratio <= 0.6:
+            return (f"{head} An LDS-02 sends about {self.EXPECTED_BYTES_PER_S:.0f} B/s, so this "
+                    f"is only ~{ratio:.1f}x that — either the rotor is not up to speed, or "
+                    f"this is reading slower than the device transmits. Try "
+                    f"`--lidar-baud {other}`.")
+        return (f"{head} The rate is about right for an LDS-02, so the baud is probably correct "
+                f"and the bytes are not LD08 packets: that is what some other device on this "
+                f"port looks like. Check that {self.port} really is the scanner "
+                f"(`ls -l /dev/serial/by-id/` — the LDS-02 is the CP2102).")
+
     def info(self) -> Dict[str, Any]:
         return {"model": self.model, "port": self.port, "points": self.points,
                 "spin": self.spin, "transport": "serial"}
+
+    def request_stop(self) -> None:
+        self._stopping = True
 
     def scans(self) -> Iterator[ScanReading]:
         ranges = np.zeros(self.points, dtype=np.uint16)
@@ -787,6 +854,8 @@ class SerialLdsSource(ScanSource):
         last_start_cdeg = None
 
         while True:
+            if self._stopping:
+                return
             chunk = self._ser.read(512)
             # Ticked before the empty-chunk check: a port that reads nothing at
             # all is precisely the case the health report exists to describe,
@@ -972,6 +1041,13 @@ class LidarFeed:
                     self._slot = reading
                     self.received += 1
         except Exception:
+            if self._stop.is_set():
+                # Shutting down.  The source was asked to stop and did not get
+                # there before its device was closed; whatever it raised on the
+                # way out is noise, and an ERROR with a traceback here makes a
+                # normal Ctrl-C look like a crash.
+                log.debug("lidar feed raised during shutdown", exc_info=True)
+                return
             # The camera stream must survive a scanner that was unplugged.
             self.failed = True
             log.exception("lidar feed stopped")
@@ -982,14 +1058,32 @@ class LidarFeed:
         return reading
 
     def stop(self, timeout: float = 2.0) -> None:
+        """Wind the reader down, then close the device — in that order.
+
+        Closing first is what produced a traceback on every Ctrl-C: the thread
+        is parked in a blocking read, and pyserial closing underneath it leaves
+        the read holding a file descriptor that is now ``None``.  So ask the
+        source to return, give it ``timeout`` to do so, and only then close.
+        A source that ignores the request still gets closed — a shutdown that
+        hangs is worse than a noisy one — but ``_run`` now knows to expect the
+        fallout.
+        """
         self._stop.set()
+        try:
+            self.source.request_stop()
+        except Exception:
+            pass
+        if self._thread is not None:
+            # The serial read timeout bounds how long this can take; the ROS
+            # spin is 50 ms.  Either way it is well inside the default.
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                log.warning("lidar reader did not stop within %.1fs; closing anyway", timeout)
+            self._thread = None
         try:
             self.source.close()
         except Exception:
             pass
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            self._thread = None
 
 
 # ---------------------------------------------------------------------------
@@ -1490,7 +1584,10 @@ def main(argv=None) -> int:
     lidar.add_argument("--lidar-health-every", type=float, default=5.0,
                        help="seconds between lidar progress reports while reading, 0 to "
                             "disable (default: %(default)s)")
-    lidar.add_argument("--lidar-baud", type=int, default=230400, help="serial baud rate")
+    lidar.add_argument("--lidar-baud", type=int, default=LDS02_BAUD,
+                       help="serial baud rate (default: %(default)s, the LDS-02/LD08 rate. "
+                            "LD06 and LD19 use 230400 with the same packet format, so if "
+                            "bytes arrive but nothing frames, this is the first thing to try)")
     lidar.add_argument("--lidar-points", type=int, default=360, help="points per revolution")
     lidar.add_argument("--lidar-spin", choices=["cw", "ccw"], default="cw",
                        help="direction the device numbers its angles in; flip this if the "
