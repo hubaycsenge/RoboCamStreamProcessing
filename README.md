@@ -97,6 +97,25 @@ Useful flags:
 --print-results             # dump every result as JSON, one per line
 ```
 
+LiDAR flags (the robot's LDS-02, streamed alongside the frames):
+
+```bash
+--lidar auto                # ros2 topic first, then the serial device; off by default
+--lidar-port /dev/tb3_lidar # default: the udev symlink, not a raw ttyUSBn
+--lidar-topic /scan         # for --lidar ros2
+--lidar-health-every 5      # seconds between progress reports, 0 to silence
+--print-scans               # dump every scan result as JSON
+```
+
+`--lidar-port` defaults to `/dev/tb3_lidar` and falls back to `/dev/ld08_lidar`
+— the two names the udev rule has used for the scanner's CP2102 bridge on this
+fleet. It deliberately does **not** try `/dev/ttyUSB0` or `/dev/ttyUSB1`: those
+numbers move between boots (the scanner is on ttyUSB1 today) and on this robot
+ttyUSB0 is as likely to be the OpenCR board. Reading a motor controller as
+ranges is worse than failing, so a raw device is only ever used if you name one.
+
+Serial mode needs `pip3 install pyserial`.
+
 Or use it as a library:
 
 ```python
@@ -133,6 +152,37 @@ The client's status line tells you the rest:
 ```text
 sent=121 ok=120 bad=0 skipped=0 | 30.1 fps out | rtt 36.3 ms | inflight=1
 ```
+
+### When the LiDAR is silent
+
+Silence from a scanner has several causes that look identical from outside —
+nothing plugged in, nothing spinning, wrong baud, wrong device, another process
+holding the port. They are told apart by *how far the data gets*, so the client
+counts the stages and reports the furthest one reached rather than just
+producing nothing:
+
+```text
+lidar: /dev/tb3_lidar — no scan yet after 5.0s. not one byte has arrived. The port
+  opened, so the device node is real, but nothing is transmitting: check the
+  scanner's power lead and that the rotor is actually spinning.
+
+lidar: /dev/tb3_lidar — no scan yet after 5.0s. 3200 bytes arrived but not one valid
+  LD08 packet was framed. That is what a baud mismatch looks like.
+
+lidar: /dev/tb3_lidar — first revolution after 0.4s, 358/360 points (99% coverage)
+lidar: /dev/tb3_lidar — 27 revolutions, 5.4/s, 359/360 points (100% coverage)
+```
+
+A port that will not open says which fix applies — missing udev rule, missing
+`dialout` group, or a busy port (usually `ld08_driver` already holding it) — and
+lists the serial devices that *do* exist.
+
+On the ROS 2 path, `--lidar auto` requires an actual publisher before it settles
+on ROS: subscribing to a topic nobody publishes succeeds happily, and without
+that check the client would sit silent on `/scan` forever instead of falling
+through to the serial device. It also distinguishes "nothing publishes `/scan`"
+(driver down) from "a publisher exists but sends nothing" (driver up, scanner
+not producing).
 
 `skipped` climbing means the server cannot keep up and the client is dropping at
 the source. `bad` climbing with `reason: "dropped"` means the server's queue is

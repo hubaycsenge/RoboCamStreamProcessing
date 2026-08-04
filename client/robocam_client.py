@@ -32,10 +32,14 @@ does and does not justify.
 from __future__ import annotations
 
 import argparse
+import errno
+import glob
 import json
 import logging
 import math
+import os
 import signal
+import stat
 import struct
 import sys
 import threading
@@ -66,7 +70,6 @@ CODEC_RAW_BGR = "raw_bgr"
 SCAN_ENC_U16_MM = "u16mm"
 
 TWO_PI = 2.0 * math.pi
-
 
 # ---------------------------------------------------------------------------
 # Frame sources
@@ -286,6 +289,150 @@ class NullSource(FrameSource):
 # ``--lidar auto`` tries them in that order.  It deliberately does *not* fall
 # back to the synthetic scanner: a robot that silently reports a fictional room
 # is far worse than one that reports no LiDAR at all.
+#
+# Silence from a scanner has several causes that look identical from the outside
+# — nothing plugged in, nothing spinning, wrong baud, wrong device, someone else
+# holding the port.  They are distinguishable by *how far the data gets*, so both
+# sources count the stages they reach and report the furthest one instead of
+# simply producing nothing.  That is what :class:`_ScanHealth` is for.
+
+
+#: Where the scanner appears in ``/dev``.  The udev rule on the robot matches the
+#: scanner's CP2102 bridge (10c4:ea60) and gives it a stable name; which name you
+#: get depends on which revision of that rule is installed, and both have been in
+#: use on this fleet.  ``tb3_lidar`` is what the robot currently has.
+#:
+#: Raw ``ttyUSBn`` numbers are deliberately absent: they are not stable across
+#: boots or replugs — the scanner is on ttyUSB1 today — and on this robot ttyUSB0
+#: is as likely to be the OpenCR board as the scanner.  Opening a motor
+#: controller and reading it as ranges is worse than failing, so a raw device is
+#: only ever used when ``--lidar-port`` names one explicitly.
+LIDAR_PORT_ALIASES = ("/dev/tb3_lidar", "/dev/ld08_lidar")
+DEFAULT_LIDAR_PORT = LIDAR_PORT_ALIASES[0]
+
+
+class LidarUnavailable(RuntimeError):
+    """No scanner could be opened.  The message says which stage failed and why."""
+
+
+def _describe_port(path: str) -> str:
+    """What ``path`` actually is — symlink target, device type, permissions."""
+    if not os.path.exists(path):
+        return f"{path}: no such device node"
+
+    bits = []
+    target = os.path.realpath(path)
+    bits.append(f"{path} -> {target}" if target != path else path)
+    try:
+        st = os.stat(path)
+        bits.append("mode %04o" % (st.st_mode & 0o7777))
+        if not stat.S_ISCHR(st.st_mode):
+            bits.append("NOT a character device")
+    except OSError as exc:
+        bits.append(f"stat failed: {exc}")
+    if not os.access(path, os.R_OK | os.W_OK):
+        bits.append("not read/writable by this user")
+    return ", ".join(bits)
+
+
+def _serial_devices_present() -> List[str]:
+    """Serial devices that exist right now, for when the wanted one does not."""
+    found: List[str] = []
+    for pattern in ("/dev/tb3_lidar", "/dev/ld08_lidar", "/dev/opencr",
+                    "/dev/arduino_nano", "/dev/ttyUSB*", "/dev/ttyACM*"):
+        for path in sorted(glob.glob(pattern)):
+            target = os.path.realpath(path)
+            entry = f"{path} -> {os.path.basename(target)}" if target != path else path
+            if entry not in found:
+                found.append(entry)
+    return found
+
+
+def _explain_open_failure(path: str, exc: Exception) -> str:
+    """Turn a pyserial exception into something that names the actual fix."""
+    hints = []
+    code = getattr(exc, "errno", None)
+    if not os.path.exists(path):
+        hints.append(
+            "the udev rule that creates this name may not be installed — see "
+            "mecanumbot_description/udev/99-turtlebot3-cdc.rules, then "
+            "`sudo udevadm control --reload-rules && sudo udevadm trigger`"
+        )
+    elif code == errno.EACCES:
+        hints.append("permission denied — `sudo usermod -aG dialout $USER`, "
+                     "then log out and back in")
+    elif code in (errno.EBUSY, errno.EAGAIN):
+        hints.append("the port is already open — ld08_driver is most likely "
+                     "holding it; stop the ROS driver, or use --lidar ros2 "
+                     "and share it through the topic instead")
+
+    detail = "%s (%s)" % (exc, _describe_port(path))
+    return "%s. %s" % (detail, " ".join(hints)) if hints else detail
+
+
+def _devices_present_line() -> str:
+    present = _serial_devices_present()
+    return "Serial devices present: %s." % (", ".join(present) if present else "none")
+
+
+class _ScanHealth:
+    """Periodic progress reports while a scanner is being read.
+
+    Two jobs.  Until the first revolution arrives it says which stage the data
+    reached, because "no scans" alone does not distinguish a dead scanner from a
+    misconfigured one.  After that it reports rate and coverage, so a scanner
+    that is technically alive but returning almost nothing is visible rather
+    than merely quiet.
+
+    ``diagnose`` is supplied by the caller and returns the stage description; it
+    is only consulted while nothing has arrived yet.
+    """
+
+    def __init__(self, what: str, diagnose: Callable[[float], str], every: float = 5.0) -> None:
+        self.what = what
+        self.every = float(every)
+        self._diagnose = diagnose
+        self.t0 = time.monotonic()
+        self._t_last = self.t0
+        self._t_last_rev = self.t0
+        self.revolutions = 0
+        self.last_filled = 0
+        self.last_points = 0
+
+    def revolution(self, filled: int, points: int) -> None:
+        """One complete revolution came out."""
+        self.revolutions += 1
+        self.last_filled, self.last_points = filled, points
+        if self.revolutions == 1:
+            log.info("lidar: %s — first revolution after %.1fs, %d/%d points (%.0f%% coverage)",
+                     self.what, time.monotonic() - self.t0, filled, points,
+                     100.0 * filled / max(1, points))
+        self._t_last_rev = time.monotonic()
+
+    def tick(self) -> None:
+        """Call often; emits at most one line per ``every`` seconds."""
+        if self.every <= 0:
+            return
+        now = time.monotonic()
+        if now - self._t_last < self.every:
+            return
+        self._t_last = now
+
+        if self.revolutions == 0:
+            log.warning("lidar: %s — no scan yet after %.1fs. %s",
+                        self.what, now - self.t0, self._diagnose(now - self.t0))
+            return
+
+        stale = now - self._t_last_rev
+        if stale > self.every:
+            log.warning("lidar: %s — %d revolutions, then nothing for %.0fs. "
+                        "The scanner stopped producing; check power and that the "
+                        "rotor is still turning.", self.what, self.revolutions, stale)
+            return
+        log.info("lidar: %s — %d revolutions, %.1f/s, %d/%d points (%.0f%% coverage)",
+                 self.what, self.revolutions, self.revolutions / max(1e-9, now - self.t0),
+                 self.last_filled, self.last_points,
+                 100.0 * self.last_filled / max(1, self.last_points))
 
 
 class ScanReading:
@@ -413,7 +560,9 @@ class Ros2ScanSource(ScanSource):
 
     model = "lds02-ros2"
 
-    def __init__(self, topic: str = "/scan", timeout_s: float = 5.0) -> None:
+    def __init__(self, topic: str = "/scan", timeout_s: float = 5.0,
+                 require_publisher: bool = False, discovery_s: float = 2.0,
+                 health_every: Optional[float] = None) -> None:
         import rclpy
         from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
         from sensor_msgs.msg import LaserScan
@@ -436,6 +585,49 @@ class Ros2ScanSource(ScanSource):
         self._sub = self._node.create_subscription(LaserScan, topic, self._on_msg, qos)
         log.info("lidar: subscribed to %s", topic)
 
+        # Subscribing always succeeds, even to a topic nobody publishes — so
+        # without this check ``auto`` would settle on ROS 2 whenever rclpy
+        # imports and then sit silent forever, never trying the serial port.
+        # Waiting for a publisher is what makes "ROS 2 is not the answer here"
+        # an answer rather than a hang.
+        publishers = self._await_publisher(discovery_s)
+        if publishers:
+            log.info("lidar: %d publisher(s) on %s", publishers, topic)
+        elif require_publisher:
+            self.close()
+            raise LidarUnavailable(
+                f"no publisher on {topic} after {discovery_s:.0f}s — ld08_driver is not "
+                f"running, or ROS_DOMAIN_ID differs from this process's. "
+                f"Check with `ros2 topic info {topic}`"
+            )
+        else:
+            log.warning("lidar: nothing publishes %s yet — waiting. If the driver "
+                        "should be up, check `ros2 topic info %s`", topic, topic)
+
+        self._health = _ScanHealth(
+            f"ros2 {topic}", self._diagnose,
+            every=timeout_s if health_every is None else health_every,
+        )
+
+    def _await_publisher(self, deadline_s: float) -> int:
+        """Spin briefly so discovery can complete, and report what turned up."""
+        end = time.monotonic() + max(0.0, deadline_s)
+        while True:
+            count = self._node.count_publishers(self._topic)
+            if count or time.monotonic() >= end:
+                return count
+            self._rclpy.spin_once(self._node, timeout_sec=0.05)
+
+    def _diagnose(self, waited_s: float) -> str:
+        count = self._node.count_publishers(self._topic)
+        if count:
+            return (f"{count} publisher(s) are advertising {self._topic} but none has sent "
+                    f"a message. The driver is up and the scanner is not producing — check "
+                    f"that the rotor is spinning and that the driver is not logging port errors.")
+        return (f"nothing is publishing {self._topic}. Start ld08_driver, or check it is not "
+                f"failing to open its port (`ros2 topic info {self._topic}`, then the "
+                f"driver's own log).")
+
     def info(self) -> Dict[str, Any]:
         return {"model": self.model, "topic": self._topic, "transport": "ros2"}
 
@@ -445,17 +637,11 @@ class Ros2ScanSource(ScanSource):
         self._new.set()
 
     def scans(self) -> Iterator[ScanReading]:
-        waited = 0.0
         while True:
             self._rclpy.spin_once(self._node, timeout_sec=0.05)
+            self._health.tick()
             if not self._new.is_set():
-                waited += 0.05
-                if waited > self._timeout_s:
-                    log.warning("lidar: nothing on %s for %.0fs — is the driver running?",
-                                self._topic, waited)
-                    waited = 0.0
                 continue
-            waited = 0.0
             self._new.clear()
             with self._lock:
                 msg = self._slot
@@ -463,10 +649,12 @@ class Ros2ScanSource(ScanSource):
                 continue
 
             ranges = np.asarray(msg.ranges, dtype=np.float32)
+            packed = _pack_mm(ranges)
+            self._health.revolution(int((packed > 0).sum()), int(packed.shape[0]))
             # ROS uses inf for "nothing within range" and nan for "no reading";
             # both are no-returns, which _pack_mm encodes as zero.
             yield ScanReading(
-                ranges_mm=_pack_mm(ranges),
+                ranges_mm=packed,
                 angle_min=float(msg.angle_min),
                 angle_increment=float(msg.angle_increment),
                 range_min=float(msg.range_min),
@@ -512,22 +700,81 @@ class SerialLdsSource(ScanSource):
     POINTS_PER_PACKET = 12
     PACKET_BYTES = 47
 
-    def __init__(self, port: str = "/dev/ttyUSB0", baud: int = 230400, points: int = 360,
-                 spin: str = "cw", crc: str = "auto", timeout: float = 1.0) -> None:
+    def __init__(self, port: str = DEFAULT_LIDAR_PORT, baud: int = 230400, points: int = 360,
+                 spin: str = "cw", crc: str = "auto", timeout: float = 1.0,
+                 health_every: float = 5.0) -> None:
         import serial  # pyserial
 
-        self.port, self.baud = port, int(baud)
+        self.baud = int(baud)
         self.points = int(points)
         self.spin = spin
         self.crc_mode = crc
         self.range_min, self.range_max = 0.12, 12.0
-        self._ser = serial.Serial(port, self.baud, timeout=timeout)
         self._buf = bytearray()
         self._crc_ok = 0
         self._crc_bad = 0
         self._crc_checking = crc != "ignore"
         self._speed_dps = 0.0
-        log.info("lidar: %s at %d baud (%s spin, crc=%s)", port, self.baud, spin, crc)
+        self._bytes = 0
+        self._packet_count = 0
+
+        self.port, self._ser = self._open(serial, port, timeout)
+        log.info("lidar: opened %s at %d baud (%s spin, crc=%s) — %s",
+                 self.port, self.baud, spin, crc, _describe_port(self.port))
+        self._health = _ScanHealth(self.port, self._diagnose, every=health_every)
+
+    def _open(self, serial, port: str, timeout: float):
+        """Open ``port``, falling back to the scanner's other udev name.
+
+        The fallback covers only :data:`LIDAR_PORT_ALIASES`, and only when the
+        caller did not name a port itself.  Those names are created by one udev
+        rule for one device, so trying the sibling cannot open something that is
+        not the scanner.  A port the operator asked for by name is never
+        second-guessed — silently opening a different device is how a motor
+        controller ends up being read as ranges.
+        """
+        candidates = [port]
+        if port == DEFAULT_LIDAR_PORT:
+            candidates += [alias for alias in LIDAR_PORT_ALIASES if alias != port]
+
+        failures = []
+        for index, candidate in enumerate(candidates):
+            try:
+                handle = serial.Serial(candidate, self.baud, timeout=timeout)
+            except Exception as exc:
+                failures.append(_explain_open_failure(candidate, exc))
+                remaining = candidates[index + 1:]
+                if remaining:
+                    log.info("lidar: %s did not open (%s), trying %s",
+                             candidate, exc, remaining[0])
+                continue
+            if candidate != port:
+                log.warning("lidar: %s was not available, using %s instead", port, candidate)
+            return candidate, handle
+
+        # Only the first candidate's failure is spelled out: the aliases fail the
+        # same way for the same reason, and repeating the udev advice per name
+        # buries it.
+        message = failures[0]
+        if len(candidates) > 1:
+            message += " (also tried %s)" % ", ".join(candidates[1:])
+        raise LidarUnavailable("%s %s" % (message, _devices_present_line()))
+
+    def _diagnose(self, waited_s: float) -> str:
+        """Which stage the bytes reached — the thing that separates the causes."""
+        if self._bytes == 0:
+            return (f"not one byte has arrived. The port opened, so the device node is real, "
+                    f"but nothing is transmitting: check the scanner's power lead and that the "
+                    f"rotor is actually spinning. A {self.port} that points at some other "
+                    f"device looks exactly like this too.")
+        if self._packet_count == 0:
+            return (f"{self._bytes} bytes arrived but not one valid LD08 packet was framed. "
+                    f"That is what a baud mismatch looks like — this is reading at {self.baud} "
+                    f"— and also what a non-LDS-02 device on this port looks like.")
+        return (f"{self._bytes} bytes and {self._packet_count} packets parsed, but no complete "
+                f"revolution yet. Normal for the first second while the rotor comes up to "
+                f"speed; if it persists, fewer than a quarter of the {self.points} bins are "
+                f"filling, so most beams are returning nothing.")
 
     def info(self) -> Dict[str, Any]:
         return {"model": self.model, "port": self.port, "points": self.points,
@@ -541,6 +788,11 @@ class SerialLdsSource(ScanSource):
 
         while True:
             chunk = self._ser.read(512)
+            # Ticked before the empty-chunk check: a port that reads nothing at
+            # all is precisely the case the health report exists to describe,
+            # and the read timeout guarantees we get here at least once a second.
+            self._bytes += len(chunk) if chunk else 0
+            self._health.tick()
             if not chunk:
                 continue
             self._buf.extend(chunk)
@@ -550,6 +802,7 @@ class SerialLdsSource(ScanSource):
                 # has come back round past zero: that is one revolution.
                 if last_start_cdeg is not None and start_cdeg < last_start_cdeg:
                     if filled >= self.points // 4:
+                        self._health.revolution(filled, self.points)
                         yield self._reading(ranges, intensities)
                         ranges = np.zeros(self.points, dtype=np.uint16)
                         intensities = np.zeros(self.points, dtype=np.uint8)
@@ -615,6 +868,7 @@ class SerialLdsSource(ScanSource):
                 del buf[:1]
                 continue
             del buf[:self.PACKET_BYTES]
+            self._packet_count += 1
 
             speed, start_cdeg = struct.unpack_from("<HH", packet, 2)
             end_cdeg, = struct.unpack_from("<H", packet, 42)
@@ -1159,28 +1413,40 @@ def build_scan_source(args) -> Optional[ScanSource]:
     that knows it is blind.
     """
     mode = args.lidar
+    health_every = getattr(args, "lidar_health_every", 5.0)
     if mode == "off":
         return None
     if mode == "synthetic":
         return SyntheticScanSource(points=args.lidar_points, hz=args.lidar_hz)
     if mode == "ros2":
-        return Ros2ScanSource(args.lidar_topic)
+        return Ros2ScanSource(args.lidar_topic, health_every=health_every)
     if mode == "serial":
         return SerialLdsSource(args.lidar_port, args.lidar_baud, args.lidar_points,
-                               spin=args.lidar_spin, crc=args.lidar_crc)
+                               spin=args.lidar_spin, crc=args.lidar_crc,
+                               health_every=health_every)
 
     errors = []
+    log.info("lidar: auto — trying ROS 2 topic %s", args.lidar_topic)
     try:
-        return Ros2ScanSource(args.lidar_topic)
+        # require_publisher, because a subscription to a topic nobody publishes
+        # succeeds happily and would end the search here with a source that can
+        # never produce anything.
+        return Ros2ScanSource(args.lidar_topic, require_publisher=True,
+                              health_every=health_every)
     except Exception as exc:
         errors.append("ros2: %s" % exc)
+        log.info("lidar: ROS 2 unavailable — %s", exc)
+
+    log.info("lidar: auto — trying serial %s", args.lidar_port)
     try:
         return SerialLdsSource(args.lidar_port, args.lidar_baud, args.lidar_points,
-                               spin=args.lidar_spin, crc=args.lidar_crc)
+                               spin=args.lidar_spin, crc=args.lidar_crc,
+                               health_every=health_every)
     except Exception as exc:
         errors.append("serial: %s" % exc)
+        log.info("lidar: serial unavailable — %s", exc)
 
-    log.warning("no lidar found, streaming camera only (%s)", "; ".join(errors))
+    log.warning("no lidar found, streaming camera only. Tried:\n  %s", "\n  ".join(errors))
     return None
 
 
@@ -1217,7 +1483,13 @@ def main(argv=None) -> int:
     lidar.add_argument("--lidar", choices=["off", "auto", "ros2", "serial", "synthetic"],
                        default="off", help="how to read the scanner (default: %(default)s)")
     lidar.add_argument("--lidar-topic", default="/scan", help="ROS 2 LaserScan topic")
-    lidar.add_argument("--lidar-port", default="/dev/ttyUSB0", help="serial device")
+    lidar.add_argument("--lidar-port", default=DEFAULT_LIDAR_PORT,
+                       help="serial device (default: %(default)s, the udev symlink for the "
+                            "scanner; falls back to /dev/ld08_lidar. Name a raw /dev/ttyUSBn "
+                            "only if you are sure which device it is)")
+    lidar.add_argument("--lidar-health-every", type=float, default=5.0,
+                       help="seconds between lidar progress reports while reading, 0 to "
+                            "disable (default: %(default)s)")
     lidar.add_argument("--lidar-baud", type=int, default=230400, help="serial baud rate")
     lidar.add_argument("--lidar-points", type=int, default=360, help="points per revolution")
     lidar.add_argument("--lidar-spin", choices=["cw", "ccw"], default="cw",
