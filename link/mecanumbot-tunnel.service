@@ -1,0 +1,21 @@
+# Robot-side systemd unit. Keeps a reverse SSH tunnel to nipg1 alive so that
+# nipg1:8200 always reaches the robot's SSH (port 22). Robot dials OUT — the
+# only direction the router's NAT allows. Install on the ROBOT (see README).
+[Unit]
+Description=Mecanumbot reverse SSH tunnel to nipg1 (robot:22 -> nipg1:8200)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/ssh -NT \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new \
+  -o UserKnownHostsFile=/home/ubuntu/.ssh/known_hosts \
+  -R 8200:localhost:22 csengehubay@nipg1.inf.elte.hu
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

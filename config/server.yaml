@@ -27,14 +27,42 @@ processor:
   # "stats"  -> report resolution/shape/rate, no models (current default)
   # "noop"   -> reply immediately, measures the transport ceiling
   # "fusion" -> stats plus the LiDAR scan projected into the camera's view
+  # "deep3r" -> CUT3R streaming reconstruction: a metric point cloud per frame
   # later: yolo, mast3r, vggt
+  #
+  # The default stays "stats": it is the measured baseline and needs no model
+  # weights, so the transport can always be checked independently of them.
+  # Switch with scripts/run_deep3r.sh, which also selects the .venv-cut3r
+  # interpreter -- deep3r cannot run in the default venv, whose numpy 2.x
+  # conflicts with CUT3R's numpy==1.26.4 pin.
   name: stats
+  # deep3r carries a recurrent state that IS the map; a second worker stepping
+  # it would interleave frames into one state and corrupt the reconstruction.
+  # The processor refuses to run concurrently rather than let that happen.
   workers: 1
   options:
     brightness: true    # mean/std, catches a lens cap or a frozen buffer
     checksum: false     # enable to detect an identical frame being resent
     lidar: true         # include the scan summary when one is attached
     imu: true           # include the inertial summary when one is attached
+
+    # ---- deep3r (used only when processor.name is "deep3r") ----
+    # Paths are expanded with ~. "size" must match the checkpoint: 224 for the
+    # linear head, 512 for the DPT head. On an RTX 3090 the 512 model runs a
+    # frame in ~175 ms; the 224 model is several times faster and is the right
+    # choice for a first end-to-end test.
+    # weights: ~/CUT3R/checkpoints/cut3r_512_dpt_4_64.pth
+    # cut3r_root: ~/CUT3R
+    # device: cuda:0
+    # size: 512
+    # every_n: 1          # run the model on one frame in N; skips still reply
+    # min_conf: 2.0       # conf starts at 1.0; 1.5 keeps ~82%, 2.0 keeps ~38%
+    # voxel_m: 0.05       # the real control on cloud size
+    # max_points: 4000    # backstop cap, lowest confidence dropped first
+    # reset_every: 0      # frames between forced state resets; 0 = never
+    # reset_on_gap: 0     # seq jump forcing a reset; 0 = 4 * every_n
+    # colors: true
+    # lidar_check: true   # compare CUT3R's metric scale against the LiDAR
 
 lidar:
   # The robot's LDS-02: 360 points a revolution, ~5 Hz, 0.12-12 m, one

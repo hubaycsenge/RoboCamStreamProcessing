@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "client"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "link"))
 import robocam_client  # noqa: E402
 
 

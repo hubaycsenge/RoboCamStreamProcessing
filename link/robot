@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# robot — give/receive ROS 2 commands to the Mecanumbot from nipg1, over the
+# permanent reverse tunnel. The ros2 node runs ON the robot (nipg1 has no route
+# to the robot's LAN), so this is an SSH wrapper, not a local ROS node.
+#
+#   robot                      interactive shell on the robot, ROS 2 sourced
+#   robot topic list           -> ros2 topic list         (ros2 is implied)
+#   robot topic echo /x        -> ros2 topic echo /x
+#   robot pub-accessory N L R  helper: publish AccessMotorCmd {n_pos,gl_pos,gr_pos}
+#   robot grippers close|open  helper: close/open grippers (neck held at 6.5)
+#   robot raw '<cmd>'          run an arbitrary remote command, ROS 2 sourced
+#   robot status               is the tunnel up? show the topic count
+set -euo pipefail
+# Resolve ssh_config next to this script rather than through an Include line in
+# ~/.ssh/config. That Include hard-codes a path, so moving this directory
+# breaks it silently -- the wrapper fails with "Could not resolve hostname
+# mecanumbot", which looks like the tunnel is down when it is not.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SSH=(ssh -F "$HERE/ssh_config")
+HOST="${MECANUMBOT_SSH_HOST:-mecanumbot}"
+ENV='export ROS_DOMAIN_ID=19 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp ROS_LOCALHOST_ONLY=0; source /opt/ros/humble/setup.bash >/dev/null 2>&1; source ~/mecanumbot_ws/install/setup.bash >/dev/null 2>&1'
+
+case "${1:-}" in
+  ""|shell)
+    exec "${SSH[@]}" -t "$HOST" "$ENV"$'\n''exec bash -i' ;;
+  raw)
+    shift; q=$(printf '%q ' "$@"); exec "${SSH[@]}" "$HOST" "$ENV; $q" ;;
+  status)
+    if n=$("${SSH[@]}" -o ConnectTimeout=6 "$HOST" "$ENV; timeout 6 ros2 topic list 2>/dev/null | wc -l" 2>/dev/null) && [ "${n:-0}" -gt 2 ]; then
+      echo "tunnel UP — $n topics visible on the robot"
+    else
+      echo "tunnel DOWN or ROS graph empty (is the robot-tunnel service running?)"; exit 1
+    fi ;;
+  pub-accessory)
+    n="${2:?n_pos}"; l="${3:?gl_pos}"; r="${4:?gr_pos}"
+    exec "${SSH[@]}" "$HOST" "$ENV; ros2 topic pub --times 4 -r 2 /cmd_accessory_pos mecanumbot_msgs/msg/AccessMotorCmd \"{n_pos: $n, gl_pos: $l, gr_pos: $r}\"" ;;
+  grippers)
+    case "${2:-}" in
+      close) exec "$0" pub-accessory 6.5 6.83 3.36 ;;   # (MAX+FRONT)/2 , (MIN+FRONT)/2
+      open)  exec "$0" pub-accessory 6.5 5.12 5.12 ;;   # FRONT (neutral) both
+      *) echo "usage: robot grippers close|open" >&2; exit 2 ;;
+    esac ;;
+  *)
+    q=$(printf '%q ' "$@"); exec "${SSH[@]}" "$HOST" "$ENV; ros2 $q" ;;
+esac

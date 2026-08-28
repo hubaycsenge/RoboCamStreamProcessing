@@ -6,3 +6,4 @@ snapshots/
 *.log
 weights/
 models/
+.venv-cut3r/

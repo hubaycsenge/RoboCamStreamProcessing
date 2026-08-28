@@ -1,0 +1,16 @@
+# Mecanumbot over the permanent robot-initiated reverse tunnel (nipg1:8200 -> robot:22).
+# Included from ~/.ssh/config. Managed in ~/mecanumbot-link/ (separate from deep3r).
+Host mecanumbot robot
+    HostName 127.0.0.1
+    Port 8200
+    User ubuntu
+    StrictHostKeyChecking accept-new
+    ServerAliveInterval 20
+    ServerAliveCountMax 3
+
+# The laptop's ad-hoc tunnel (ssh -R 8222:192.168.0.240:22) lands here instead:
+Host mecanumbot-laptop
+    HostName 127.0.0.1
+    Port 8222
+    User ubuntu
+    StrictHostKeyChecking accept-new

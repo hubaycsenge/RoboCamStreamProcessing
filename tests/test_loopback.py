@@ -24,7 +24,7 @@ from robocam.server import StreamServer
 
 # The client is deployed to the robot as a standalone file, so it is not on the
 # package path; add its directory explicitly.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "client"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "link"))
 import robocam_client  # noqa: E402
 
 

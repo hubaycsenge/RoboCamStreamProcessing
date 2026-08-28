@@ -3,6 +3,9 @@
 Adding a model means writing a Processor subclass and registering it here; the
 server picks it up via ``processor.name`` in the YAML config.
 
+Registered models:
+    "deep3r" -> CUT3R streaming reconstruction; a metric point cloud per frame
+
 Planned additions (see README):
     "yolo"   -> ultralytics detection, per-frame
     "mast3r" -> two-view matching / relative pose, on keyframe pairs
@@ -42,6 +45,7 @@ def available() -> list[str]:
 
 # -- built-ins ---------------------------------------------------------------
 
+from .deep3r import Deep3RProcessor  # noqa: E402
 from .fusion import FusionProcessor  # noqa: E402
 from .noop import NoopProcessor  # noqa: E402
 from .stats import StatsProcessor  # noqa: E402
@@ -49,6 +53,10 @@ from .stats import StatsProcessor  # noqa: E402
 register("stats", StatsProcessor)
 register("noop", NoopProcessor)
 register("fusion", FusionProcessor)
+# Importing this one must stay cheap: torch and CUT3R load in setup(), on the
+# worker thread, so a server running "stats" on a machine without CUDA is not
+# stopped at startup by a processor it never selected.
+register("deep3r", Deep3RProcessor)
 
 __all__ = [
     "Frame",
@@ -60,4 +68,5 @@ __all__ = [
     "StatsProcessor",
     "NoopProcessor",
     "FusionProcessor",
+    "Deep3RProcessor",
 ]

@@ -1,0 +1,40 @@
+# Robot-side systemd unit. Forward tunnel for the RoboCam data path: makes the
+# server's ZeroMQ port reachable from the robot as 127.0.0.1:5555.
+#
+# Why this is needed at all: the robot sits on the lab WiFi (192.168.1.0/24)
+# behind the router's NAT. Measured from the robot, nipg36's LAN address
+# 10.128.17.196:5555 is UNREACHABLE, so the client cannot dial the server
+# directly however the README used to describe it. What *is* reachable from the
+# robot is nipg36's public SSH port, 10113. So the robot dials out to that --
+# the only direction NAT allows -- and forwards the server port back to itself.
+#
+# The server binds 0.0.0.0:5555 on nipg36, so "localhost:5555" below is
+# nipg36's own view of it once the SSH session lands there.
+#
+# Install on the ROBOT, alongside mecanumbot-tunnel.service:
+#   sudo cp mecanumbot-deep3r-tunnel.service /etc/systemd/system/
+#   sudo systemctl enable --now mecanumbot-deep3r-tunnel.service
+#
+# Then point the client at the local end:
+#   python3 robocam_client.py --server tcp://127.0.0.1:5555
+[Unit]
+Description=Mecanumbot forward SSH tunnel to the RoboCam server (robot:5555 -> nipg36:5555)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+ExecStartPre=/bin/sleep 5
+# ExitOnForwardFailure matters here: without it, a tunnel whose forward was
+# refused stays "up" as a live SSH session and the client blocks on a port
+# nothing is listening behind, which is indistinguishable from a dead server.
+ExecStart=/usr/bin/ssh -NT -p 10113 \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new \
+  -o UserKnownHostsFile=/home/ubuntu/.ssh/known_hosts \
+  -L 5555:localhost:5555 csengehubay@nipg36.inf.elte.hu
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -4,10 +4,14 @@ Video link between the robot's Jetson Orin Nano and the GPU server `nipg36`.
 The Orin streams its webcam, the server decodes each frame and replies over the
 same connection with whatever the current processor produced.
 
-**Status: transport layer complete and measured.** The only processor today
-reports image metadata — it answers "are frames actually arriving, and what
-shape are they?". YOLO / MASt3R / VGGT plug in as additional processors without
-the wire protocol changing. See [Adding a model](#adding-a-model).
+**Status: transport layer complete and measured; the first model is in.**
+`stats` still answers "are frames actually arriving, and what shape are they?"
+and remains the default, because it needs no weights and so keeps the transport
+checkable independently of any model. `deep3r` runs CUT3R over the stream and
+returns a metric point cloud per frame — see
+[Reconstruction](#reconstruction-the-deep3r-processor). YOLO and the rest plug
+in the same way, without the wire protocol changing. See
+[Adding a model](#adding-a-model).
 
 ```text
   Jetson Orin Nano                         nipg36 (10.128.17.196)
@@ -74,11 +78,11 @@ Leave it running across SSH disconnects with `tmux new -s robocam` (or
 
 ## Client setup (the Orin)
 
-`client/robocam_client.py` is standalone — one file, no dependency on the
+`link/robocam_client.py` is standalone — one file, no dependency on the
 `robocam` package.
 
 ```bash
-scp -P 10113 client/robocam_client.py orin:~/
+scp -P 10113 link/robocam_client.py orin:~/
 ssh orin
 pip3 install pyzmq numpy          # opencv ships with JetPack
 ./netcheck.sh 10.128.17.196 5555  # do this first, see Networking
@@ -469,7 +473,147 @@ every call — returning `{"status": "buffering"}` keeps the client's flow contr
 healthy while the window fills.
 
 Point clouds are large; do not put a full VGGT depth map in `result.data` at 30
-fps. Either downsample it, or return a handle and fetch it out of band.
+fps. Either downsample it, or return a handle and fetch it out of band. The
+`deep3r` processor takes the first route — see below for what that costs.
+
+None of the above applies to `deep3r`, and that is the reason it exists: CUT3R
+is recurrent rather than windowed, so there is no buffer to fill, no
+`{"status": "buffering"}` phase, and `queue.drop_policy` can stay on `oldest`.
+
+---
+
+## Reconstruction: the `deep3r` processor
+
+The first real model on this server. It runs
+[CUT3R](https://github.com/CUT3R/CUT3R) over the frame stream and returns, per
+frame, a **metric-scale** point cloud in a world frame common to the whole
+session, plus the camera pose that produced it. That is the "Deep3R" box in the
+system diagram: images up, point cloud back down, Nav2 consuming the cloud.
+
+```bash
+./scripts/run_deep3r.sh                 # 512 DPT checkpoint, GPU 1
+DEEP3R_WEIGHTS=~/CUT3R/checkpoints/cut3r_224_linear_4.pth ./scripts/run_deep3r.sh
+```
+
+### Why CUT3R and not MASt3R or VGGT
+
+CUT3R carries a persistent recurrent state and updates it with each frame, so
+cost per frame is constant and every frame's pointmap already lives in one
+coordinate system. The alternatives reconstruct a window from scratch on each
+call: you pay for the whole window every frame, and the world frame jumps
+whenever the window slides. CUT3R also predicts **metric** scale, which is what
+decides whether a monocular reconstruction can feed a costmap at all.
+
+The cost is coupling to CUT3R internals. Its public entry points are batch:
+`inference_recurrent` starts from a fresh state each call, and `inference_step`
+is a *probe* — it queries the state at a virtual, unobserved view and discards
+the update, which is CUT3R's "imagine a viewpoint" feature rather than the
+streaming path. Streaming means `_encode_views` + `_forward_decoder_step`,
+mirroring the loop in `ARCroco3DStereo._forward_impl`. Both are private, so pin
+the checkout: an upstream rename of those two is what will break this.
+
+### Environment
+
+`deep3r` **cannot run in the default venv**. CUT3R pins `numpy==1.26.4` and the
+server venv is on numpy 2.x, so they cannot share an interpreter. `.venv` stays
+the known-good transport baseline; `.venv-cut3r` is the one with torch in it,
+and `scripts/run_deep3r.sh` selects it. The processor imports torch inside
+`setup()` on the worker thread, so registering it costs nothing and a server
+running `stats` still starts on a machine with no CUDA at all.
+
+Two things that cost time to find:
+
+- **`curope` is not optional**, despite the ImportError fallback in croco's
+  `pos_embed.py` suggesting otherwise. CUT3R marks the pose token with position
+  **-1**; the CUDA kernel evaluates the sinusoid from that value, but the
+  pure-PyTorch fallback builds a lookup table and does `F.embedding(-1, ...)`,
+  which dies as an asynchronous device-side assert several layers from the
+  cause. There is no nvcc on this cluster and no conda, so the processor shifts
+  every position by a global +1 instead. That is exact, not an approximation:
+  RoPE reaches attention only through `q · k`, which depends on the *difference*
+  of two positions. The shift must be global — offsetting by each call's own
+  minimum would move the decoder's queries and keys by different amounts in
+  cross-attention. Compiling `curope` makes the patch a no-op and is faster.
+- **Confidence starts at 1.0, not 0.0** (`conf_mode=('exp', 1, inf)`). Measured
+  on a real frame from this robot's camera: p5 1.06, p50 1.9, p95 2.4. So
+  `min_conf: 1.5` keeps ~82% of points, `2.0` keeps ~38%, and anything at 3.0
+  or above keeps **none**.
+
+### Measured
+
+RTX 3090 (sm_86), 512 DPT checkpoint, real 1280x720 frames from the robot:
+
+| | frame 0 | frame 1 | frame 2 |
+| --- | --- | --- | --- |
+| inference | 221 ms | 162 ms | 160 ms |
+| points after gating | 50k/156k | 87k/156k | 115k/156k |
+| points on the wire | 1009 | 2612 | 3650 |
+| payload | 11.8 kB | 30.6 kB | 42.8 kB |
+| median depth | 2.20 m | 2.85 m | 2.91 m |
+
+About 6 Hz, and the point count *rises* frame over frame — the recurrent state
+growing more confident as it sees more of the scene. Model load plus warm-up is
+~25 s, paid in `setup()` so the robot's first frame is not the one that pays it.
+
+Not yet measured on nipg36's TITAN RTX (sm_75), which is the node the robot can
+actually reach. Expect it to be slower.
+
+### State is the map
+
+Three consequences, all of them config:
+
+- **`workers` must be 1.** Two workers stepping one recurrent state interleave
+  frames into it and corrupt the reconstruction with nothing looking wrong. The
+  processor refuses to run concurrently rather than leave that to the config.
+- **Dropped frames are gaps, not corruption.** CUT3R accepts unordered
+  collections, so an evicted frame is a discontinuity it tolerates. A *large*
+  jump is different: the next frame overlaps nothing in the state, so
+  `reset_on_gap` starts a new map rather than welding two unrelated scenes into
+  one coordinate frame.
+- **State drifts over a long run.** `reset_every` bounds it, and the mechanism
+  is built into the model: a view flagged `reset` restores the initial state.
+
+Every reset increments `map_id` in the result. The robot must treat a change in
+`map_id` as "this is a new map", not as a continuation — the world frame
+restarts with it.
+
+### On the wire
+
+A 512-mode pointmap is ~150k points, which as JSON is tens of megabytes a frame.
+The cloud is therefore confidence-filtered, voxel-downsampled, capped at
+`max_points` (dropping the *least confident* first, so the cap thins noise
+rather than the surfaces Nav2 needs), quantised to 16 bits against a per-cloud
+origin and scale, and base64'd into the existing result envelope. No protocol
+change. The quantisation is per-cloud rather than fixed so it adapts to the
+extent of what was seen instead of clipping a long corridor; 16 bits over a 10 m
+extent is a fifth of a millimetre.
+
+```python
+xyz = np.frombuffer(base64.b64decode(cloud["xyz_u16"]), "<u2").reshape(-1, 3)
+points = np.asarray(cloud["origin"]) + cloud["scale"] * xyz   # metres
+```
+
+`data.scale_check` compares the cloud's near depth with the LiDAR's forward
+range when a scan is attached. CUT3R's metric claim is what the whole approach
+rests on and nothing else in the pipeline would notice if it were wrong by a
+factor of two; a ratio near 1.0 means the two sensors agree.
+
+### Serving it
+
+The robot connects to `10.128.17.196:5555`, and **nipg36 is the only node with
+an address on that network** — nipg10 and the rest are on `157.181.160.x`. So
+development and benchmarking can use any GPU node through Slurm (nipg10's 3090
+is sm_86, and much faster than nipg36's TITAN RTX), but the job that actually
+serves the robot has to be allocated on nipg36:
+
+```bash
+salloc --no-shell -w nipg36 --gres=gpu:1 -c 8 --mem=24G -t 08:00:00
+srun --jobid=<id> --overlap ./scripts/run_deep3r.sh
+```
+
+Slurm only works from the `nipg1` login node — the `nipg36:10113` container
+cannot resolve the compute-node names and `srun` fails with
+`can't find address for host nipg3`.
 
 ---
 
@@ -488,9 +632,19 @@ robocam/                 server package
     base.py              Processor interface and Frame
     stats.py             default: geometry, rate, brightness
     noop.py              transport-ceiling benchmark
-client/robocam_client.py standalone, deploy to the Orin
+    deep3r.py            CUT3R streaming reconstruction -> point cloud
+link/                    everything crossing the robot <-> cluster boundary
+  robocam_client.py      standalone data path, deploy to the Orin
+  robot                  ros2 over the reverse tunnel, run from nipg1
+  ssh_config             host aliases; the wrapper reads this directly
+  ros-env.sh             ROS env sourced on the robot
+  mecanumbot-tunnel.service       reverse tunnel: robot:22 -> nipg1:8200
+  mecanumbot-deep3r-tunnel.service forward tunnel: robot:5555 -> nipg36:5555
+  netcheck.sh            can the robot reach the server?
 config/server.yaml
-scripts/                 setup_server.sh, run_server.sh, netcheck.sh
+scripts/                 setup_server.sh, run_server.sh, run_deep3r.sh
+.venv/                   server only (numpy 2.x)
+.venv-cut3r/             server + torch + CUT3R (numpy 1.26.4)
 tests/                   32 tests, including real sockets end to end
 ```
 
@@ -502,8 +656,18 @@ the result goes out immediately.
 ## Tests
 
 ```bash
-./.venv/bin/python -m pytest tests/ -q     # 32 passed
+./.venv/bin/python -m pytest tests/ -q
 ```
+
+`tests/test_deep3r.py` runs in the **default** venv, with no torch and no GPU:
+everything below the model — the confidence filter, the voxel reduction, the
+quantisation, and the state machine that decides when a map ends — is plain
+numpy, and that is where a bug corrupts a map quietly. Keeping it testable
+without weights is what lets it be checked on a laptop.
+
+`tests/test_config.py::test_missing_file` fails on this filesystem: it expects
+`FileNotFoundError` for `/nonexistent/server.yaml` and gets `PermissionError`.
+That is the environment, not the code.
 
 `tests/test_loopback.py` runs a real server on a real TCP socket and talks to it
 both with a bare DEALER (to exercise the protocol directly) and with the actual
