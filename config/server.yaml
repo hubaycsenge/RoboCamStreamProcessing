@@ -4,8 +4,12 @@
 # error rather than a silent no-op.
 
 server:
-  # 0.0.0.0 so the robot on the university LAN can reach us.
-  # nipg36's LAN address is 10.128.17.196 — that is what the robot connects to.
+  # 0.0.0.0 so a client on the node, or one arriving through the SSH bridge, can
+  # reach us. The robot does NOT dial a cluster address: it is behind the lab
+  # router's NAT, so it dials out over SSH and meets the server at a rendezvous
+  # port on nipg1. See link/README.md; scripts/run_deep3r_bridged.sh is the
+  # cluster-side half. Binding 0.0.0.0 rather than 127.0.0.1 is what lets a
+  # local benchmark client on the same node connect too.
   bind: "tcp://0.0.0.0:5555"
   io_poll_ms: 20
   # Drop a session that has gone quiet for this long.

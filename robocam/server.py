@@ -234,9 +234,16 @@ class StreamServer:
                 if self.cfg.imu.enabled else "off"
             ),
         )
+        # These are addresses on *this* node, for a benchmark client running
+        # here. They are deliberately not labelled as somewhere the robot can
+        # dial: the robot is behind the lab router's NAT and reaches the server
+        # only through the SSH bridge to nipg1 (see link/README.md). The banner
+        # used to say "robot can connect to", which sent people to chase a
+        # cluster address that was never reachable from the robot.
+        port = self.cfg.server.bind.rsplit(":", 1)[-1]
         for addr in _local_addresses():
-            port = self.cfg.server.bind.rsplit(":", 1)[-1]
-            log.info("  robot can connect to tcp://%s:%s", addr, port)
+            log.info("  local clients can connect to tcp://%s:%s", addr, port)
+        log.info("  the robot reaches this through the nipg1 bridge, not the above")
 
     def stop(self) -> None:
         self._stop.set()

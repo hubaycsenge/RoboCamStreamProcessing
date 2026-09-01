@@ -2,23 +2,50 @@
 # server's ZeroMQ port reachable from the robot as 127.0.0.1:5555.
 #
 # Why this is needed at all: the robot sits on the lab WiFi (192.168.1.0/24)
-# behind the router's NAT. Measured from the robot, nipg36's LAN address
-# 10.128.17.196:5555 is UNREACHABLE, so the client cannot dial the server
-# directly however the README used to describe it. What *is* reachable from the
-# robot is nipg36's public SSH port, 10113. So the robot dials out to that --
-# the only direction NAT allows -- and forwards the server port back to itself.
+# behind the router's NAT. Nothing outside can dial in, so the robot dials out
+# -- the only direction NAT allows -- and forwards the server port back to
+# itself. The client then talks to tcp://127.0.0.1:5555.
 #
-# The server binds 0.0.0.0:5555 on nipg36, so "localhost:5555" below is
-# nipg36's own view of it once the SSH session lands there.
+# Why nipg1 and not nipg36. This unit used to target nipg36's public SSH port
+# (10113), because nipg36's LAN address 10.128.17.196:5555 is UNREACHABLE from
+# the robot and 10113 was the port measured to work. But nipg1 is reachable from
+# the robot too -- mecanumbot-tunnel.service has been dialling it all along --
+# and nipg1 is the better endpoint for one reason that matters more than
+# tidiness: *nipg1 has no GPU*. It is the login node, absent from `sinfo -N`.
+# So the server cannot run on nipg1, and pointing the robot here forces the
+# split that should have existed from the start:
+#
+#   this tunnel  = rendezvous, fixed, always nipg1
+#   the server   = compute, a Slurm job, on whatever GPU node is free
+#
+# Pinning the robot to nipg36 pinned the *compute* to nipg36 as a side effect,
+# and nipg36 is 2x TITAN RTX -- Turing, sm_75, no bf16. That is the slowest
+# thing you would pick for deep3r on purpose. With this unit on nipg1 the job
+# can land on nipg10's 3090s (sm_86) or anything else with a card free.
+#
+# The other half of the path is the job's reverse tunnel back to nipg1, opened
+# by scripts/run_deep3r_bridged.sh:
+#
+#   robot:5555 --ssh -L--> nipg1:5555 <--ssh -R-- compute node :5555 (server)
+#
+# It has to be that way round. You cannot ssh *into* a compute node -- nipg36:22
+# is connection-refused -- so nipg1 cannot reach in with -L. The job reaches out
+# instead, which was confirmed working from nipg3.
+#
+# "localhost:5555" below is nipg1's own loopback once the SSH session lands
+# there, which is exactly where the job's reverse forward binds (sshd's
+# GatewayPorts defaults to no). The two halves meet on that port and nowhere
+# else, so neither side needs to know the other's address.
 #
 # Install on the ROBOT, alongside mecanumbot-tunnel.service:
 #   sudo cp mecanumbot-deep3r-tunnel.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
 #   sudo systemctl enable --now mecanumbot-deep3r-tunnel.service
 #
 # Then point the client at the local end:
 #   python3 robocam_client.py --server tcp://127.0.0.1:5555
 [Unit]
-Description=Mecanumbot forward SSH tunnel to the RoboCam server (robot:5555 -> nipg36:5555)
+Description=Mecanumbot forward SSH tunnel to the RoboCam server (robot:5555 -> nipg1:5555)
 After=network-online.target
 Wants=network-online.target
 
@@ -28,11 +55,16 @@ ExecStartPre=/bin/sleep 5
 # ExitOnForwardFailure matters here: without it, a tunnel whose forward was
 # refused stays "up" as a live SSH session and the client blocks on a port
 # nothing is listening behind, which is indistinguishable from a dead server.
-ExecStart=/usr/bin/ssh -NT -p 10113 \
+#
+# Note this unit restarts every 10 s whenever no job is bridged to nipg1:5555,
+# because the forward has nothing to connect to. Harmless, but noisy in the
+# journal -- disable it when you are not running the server, same advice as
+# before.
+ExecStart=/usr/bin/ssh -NT \
   -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
   -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new \
   -o UserKnownHostsFile=/home/ubuntu/.ssh/known_hosts \
-  -L 5555:localhost:5555 csengehubay@nipg36.inf.elte.hu
+  -L 5555:localhost:5555 csengehubay@nipg1.inf.elte.hu
 Restart=always
 RestartSec=10
 

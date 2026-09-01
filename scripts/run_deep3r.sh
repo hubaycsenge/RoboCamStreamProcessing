@@ -9,17 +9,29 @@
 # two cannot share an interpreter. .venv stays the known-good transport
 # baseline; .venv-cut3r is the one with torch in it.
 #
-# GPU note: nipg36 has two TITAN RTX cards and GPU 0 is usually occupied by
-# another user, so we default to GPU 1, same as run_server.sh.
+# GPU note: we default to GPU 1. That started as a nipg36 habit (two TITAN RTX,
+# GPU 0 usually taken by someone else) and is harmless elsewhere -- under Slurm
+# --gres=gpu:1 gives you one card and CUDA_VISIBLE_DEVICES is already scoped to
+# it. Override if a node hands you a different layout.
 #
-# Under Slurm, allocate on nipg36 specifically:
+# Under Slurm, on any node with a free card:
 #
-#   salloc --no-shell -w nipg36 --gres=gpu:1 -c 8 --mem=24G -t 08:00:00
+#   salloc --no-shell --gres=gpu:1 -c 8 --mem=24G -t 08:00:00
 #   srun --jobid=<id> --overlap ./scripts/run_deep3r.sh
 #
-# It has to be nipg36: that is the only node with a 10.128.17.x address, which
-# is the network the robot is on. A job that lands on any other node cannot be
-# reached by the robot at all.
+# This script serves whatever node it lands on and nothing else; a robot cannot
+# reach it. Earlier versions of this comment claimed the job "has to be nipg36",
+# because nipg36 is the only node with a 10.128.17.x address and that was
+# believed to be the robot's network. Both halves were wrong: the robot is on
+# lab WiFi at 192.168.1.240, and 10.128.17.196 is routed from nipg1 anyway. What
+# is true (measured 2026-08-28, see link/README.md) is that the robot cannot
+# reach *any* cluster node's ZeroMQ port directly -- it is behind the lab
+# router's NAT and has to dial out over SSH.
+#
+# So: use this script for local benchmarking, and
+# scripts/run_deep3r_bridged.sh when a robot is actually connected. That one
+# opens the reverse tunnel to the rendezvous on nipg1 that the robot's forward
+# tunnel is waiting on, which is what frees the job from any particular node.
 
 set -euo pipefail
 

@@ -1,8 +1,12 @@
 # RoboCamStreamProcessing
 
-Video link between the robot's Jetson Orin Nano and the GPU server `nipg36`.
-The Orin streams its webcam, the server decodes each frame and replies over the
-same connection with whatever the current processor produced.
+Video link between the robot's Jetson Orin Nano and a GPU node on the NIPG
+cluster. The Orin streams its webcam, the server decodes each frame and replies
+over the same connection with whatever the current processor produced.
+
+The server is a Slurm job on whatever node has a card free; the robot reaches it
+through a fixed SSH rendezvous on the `nipg1` login node, so which node the job
+landed on is never the robot's problem. See [Networking](#networking).
 
 **Status: transport layer complete and measured; the first model is in.**
 `stats` still answers "are frames actually arriving, and what shape are they?"
@@ -14,15 +18,15 @@ in the same way, without the wire protocol changing. See
 [Adding a model](#adding-a-model).
 
 ```text
-  Jetson Orin Nano                         nipg36 (10.128.17.196)
-  ────────────────                         ──────────────────────
+  Jetson Orin Nano                         GPU node (Slurm job)
+  ────────────────                         ────────────────────
   webcam                                        ZeroMQ ROUTER :5555
     │                                                 │
     ▼                                                 ▼
   capture (V4L2 / GStreamer)                  IO thread — never blocks
     │                                          decode JPEG → numpy
     ▼                                                 │
-  JPEG encode ──────► DEALER ───── LAN ──────►  FrameQueue (depth 2,
+  JPEG encode ──────► DEALER ─── ssh bridge ─►  FrameQueue (depth 2,
     │                    ▲                       drops oldest when full)
     │                    │                             │
   in-flight window ≤ 3   │                             ▼
@@ -45,18 +49,23 @@ a silently discarded frame would slowly starve the sender.
 
 ---
 
-## Server setup (nipg36)
+## Server setup
 
-Already done in this checkout, but re-runnable and idempotent:
+Re-runnable and idempotent:
 
 ```bash
-cd ~/RoboCamStreamProcessing
+cd ~/mecanumbot_repos/RoboCamStreamProcessing
 ./scripts/setup_server.sh
 ```
 
-The system Python on nipg36 is 3.8, which is too old for current torch, and
+The system Python on these nodes is 3.8, which is too old for current torch, and
 there is no root access or usable Docker. So `uv` installs into `~/.local/bin`
 and manages its own Python 3.11 in `.venv/`. Nothing touches the system.
+
+**Run it from nipg1, not from nipg36.** The venvs currently in this checkout were
+built inside the nipg36 container and point at `/home/csengehubay/...`, a path
+that exists on no other node — see
+[A trap when moving off nipg36](#a-trap-when-moving-off-nipg36).
 
 Run it:
 
@@ -66,11 +75,13 @@ Run it:
 ./scripts/run_server.sh --bind tcp://0.0.0.0:5600 --log-level DEBUG
 ```
 
-Startup prints the address the robot should dial:
+Startup prints this node's own addresses — for a benchmark client running on the
+same node, *not* for the robot, which arrives via the nipg1 bridge instead:
 
 ```text
 listening on tcp://0.0.0.0:5555 | processor=stats workers=1 | queue depth=2 drop=oldest
-  robot can connect to tcp://10.128.17.196:5555
+  local clients can connect to tcp://10.128.17.196:5555
+  the robot reaches this through the nipg1 bridge, not the above
 ```
 
 Leave it running across SSH disconnects with `tmux new -s robocam` (or
@@ -81,13 +92,20 @@ Leave it running across SSH disconnects with `tmux new -s robocam` (or
 `link/robocam_client.py` is standalone — one file, no dependency on the
 `robocam` package.
 
+Copy it over the reverse tunnel that is already up (`nipg1:8200` reaches the
+robot's sshd — see `link/README.md`):
+
 ```bash
-scp -P 10113 link/robocam_client.py orin:~/
-ssh orin
+scp -P 8200 link/robocam_client.py ubuntu@127.0.0.1:~/
+ssh -p 8200 ubuntu@127.0.0.1
 pip3 install pyzmq numpy          # opencv ships with JetPack
-./netcheck.sh 10.128.17.196 5555  # do this first, see Networking
-python3 robocam_client.py --server tcp://10.128.17.196:5555
+./netcheck.sh                     # do this first, see Networking
+python3 robocam_client.py --server tcp://127.0.0.1:5555
 ```
+
+`127.0.0.1:5555` is the local end of `mecanumbot-deep3r-tunnel.service`, not a
+server on the robot. There is no cluster address to put here — see
+[Networking](#networking).
 
 Useful flags:
 
@@ -161,7 +179,7 @@ def on_result(r):
     if r["ok"]:
         print(r["width"], r["height"], r["data"]["session_fps"], r["rtt_ms"])
 
-client = RoboCamClient("tcp://10.128.17.196:5555", on_result=on_result)
+client = RoboCamClient("tcp://127.0.0.1:5555", on_result=on_result)
 client.run(OpenCVSource("0", 1280, 720, 30))
 ```
 
@@ -354,24 +372,35 @@ The two that matter most:
 
 ## Networking
 
-The server binds `0.0.0.0:5555`; the robot connects to `10.128.17.196:5555` on
-the university LAN. If `scripts/netcheck.sh` fails from the robot and the server
-is definitely running, the usual causes in order are: wrong address (check
-`hostname -I` on nipg36), you are off the university network, or a host firewall
-(needs an admin — `sudo ufw status`).
+The server binds `0.0.0.0:5555`. **The robot does not dial a cluster address**,
+and never could: it sits behind the lab router's NAT at `192.168.1.240`, so
+nothing outside can reach in and no cluster IP is reachable from it. Earlier
+versions of this section said the robot connects to `10.128.17.196:5555` — that
+was wrong, and `link/README.md` has the measured evidence.
 
-**From home**, the LAN address is unreachable. Either use the university VPN, or
-tunnel over the SSH port that already works:
+What actually happens is a two-leg SSH bridge meeting on a fixed rendezvous port
+on **nipg1**, the login node:
 
-```bash
-# On the robot (or your laptop): forward local 5555 to the server's 5555.
-ssh -p 10113 -N -L 5555:localhost:5555 csengehubay@nipg36.inf.elte.hu
-# Then point the client at the local end of the tunnel:
-python3 robocam_client.py --server tcp://127.0.0.1:5555
+```text
+  robot:5555 ──ssh -L──▶ nipg1:5555 ◀──ssh -R── compute node:5555 (the server)
+    mecanumbot-deep3r-tunnel.service        scripts/run_deep3r_bridged.sh
 ```
 
-Expect to lower `--fps` and `--quality` over the VPN — 10 Mbit/s at 720p30 is
-comfortable on the LAN, less so on a home uplink.
+Both ends bind nipg1's loopback, so they meet there and nowhere else. The client
+always talks to `tcp://127.0.0.1:5555` regardless of where the server landed.
+
+nipg1 is the rendezvous *because* it has no GPU — being unable to host the server
+is what keeps the endpoint fixed while the compute stays free to go wherever a
+card is. See [Serving it](#serving-it).
+
+If the client cannot connect, run `link/netcheck.sh` **on the robot**; its
+failure output walks the path leg by leg. `0.0.0.0` in the bind is for local
+benchmark clients on the same node, not for the robot.
+
+**From home**, nothing changes — the robot's path is SSH either way, and it is
+your own access to nipg1 that needs the university VPN. Expect to lower `--fps`
+and `--quality` over a home uplink: 10 Mbit/s at 720p30 is comfortable on the
+LAN, less so otherwise.
 
 ---
 
@@ -444,7 +473,12 @@ Worth knowing before you install anything:
   no FlashAttention — both need sm_80+. VGGT and MASt3R must run in **fp16**
   with PyTorch's SDPA fallback, not `flash_attn`. Expect to pass
   `dtype=torch.float16` and to skip any `flash-attn` install step in their
-  READMEs; it will not build usefully here.
+  READMEs; it will not build usefully there.
+
+  This is now avoidable rather than a fact of life. The job is no longer pinned
+  to nipg36, so **prefer an Ampere node** — nipg10 and nipg32 (`sinfo -N -o
+  "%N %G"` lists what is where) — and none of the above applies. The sibling
+  `deep3r-live` project migrated off Turing for exactly this reason.
 - **GPU 0 is usually occupied by another user** (~20 GB of 24 GB in use).
   `run_server.sh` defaults to `CUDA_VISIBLE_DEVICES=1`. Check with `nvidia-smi`
   before assuming you have memory.
@@ -555,8 +589,10 @@ About 6 Hz, and the point count *rises* frame over frame — the recurrent state
 growing more confident as it sees more of the scene. Model load plus warm-up is
 ~25 s, paid in `setup()` so the robot's first frame is not the one that pays it.
 
-Not yet measured on nipg36's TITAN RTX (sm_75), which is the node the robot can
-actually reach. Expect it to be slower.
+Not yet measured on nipg36's TITAN RTX (sm_75); expect it to be slower. That
+number used to matter because the robot was pinned to nipg36. It no longer is —
+the job can land on any node — so nipg36's figure is now a curiosity rather than
+the number the robot lives with.
 
 ### State is the map
 
@@ -600,20 +636,56 @@ factor of two; a ratio near 1.0 means the two sensors agree.
 
 ### Serving it
 
-The robot connects to `10.128.17.196:5555`, and **nipg36 is the only node with
-an address on that network** — nipg10 and the rest are on `157.181.160.x`. So
-development and benchmarking can use any GPU node through Slurm (nipg10's 3090
-is sm_86, and much faster than nipg36's TITAN RTX), but the job that actually
-serves the robot has to be allocated on nipg36:
+The job that serves the robot can run on **any** node with a free GPU:
 
 ```bash
-salloc --no-shell -w nipg36 --gres=gpu:1 -c 8 --mem=24G -t 08:00:00
-srun --jobid=<id> --overlap ./scripts/run_deep3r.sh
+salloc --no-shell --gres=gpu:1 -c 8 --mem=24G -t 08:00:00
+srun --jobid=<id> --overlap ./scripts/run_deep3r_bridged.sh
 ```
 
-Slurm only works from the `nipg1` login node — the `nipg36:10113` container
-cannot resolve the compute-node names and `srun` fails with
-`can't find address for host nipg3`.
+`run_deep3r_bridged.sh` starts the server, waits for it to bind, and only then
+opens a reverse tunnel to nipg1:5555 — the port the robot's own forward tunnel
+is already waiting on. Ordering it that way means a live tunnel implies a live
+server, never a socket in front of nothing. Use plain `run_deep3r.sh` for local
+benchmarking, where nothing has to cross the cluster boundary.
+
+Prefer Ampere or newer. **nipg10's 3090s are sm_86 and much faster than nipg36's
+TITAN RTX** (sm_75, Turing, no bf16) — see
+[What this hardware will and will not do](#what-this-hardware-will-and-will-not-do).
+
+This used to read "the job has to be allocated on `-w nipg36`", on the grounds
+that nipg36 is the only node with a `10.128.17.x` address and that this was the
+robot's network. Both halves were wrong: the robot is on lab WiFi at
+`192.168.1.240`, and `10.128.17.196` is routed from nipg1 anyway (0.7 ms, via
+`157.181.160.254`). The real constraint was only ever that the robot must reach
+*something* by SSH, and nipg1 serves that better — it is where the control
+tunnel already lands, and having no GPU it cannot quietly become the compute
+node too. Pinning the robot to nipg36 pinned the compute to the slowest
+available card as a side effect.
+
+Two things stay true and are worth keeping in mind:
+
+- **Slurm only works from `nipg1`.** The `nipg36:10113` container cannot resolve
+  the compute-node names and `srun` fails with
+  `can't find address for host nipg3`. Allocate from nipg1.
+- **You cannot ssh into a compute node** (`nipg36:22` is connection-refused),
+  which is why the job dials out to nipg1 rather than nipg1 dialling in.
+
+One prerequisite, once: nipg1's own key must be authorised on nipg1, or the
+job's tunnel cannot authenticate — see step 2 of `link/README.md`'s setup.
+
+### A trap when moving off nipg36
+
+The venvs in this checkout were built inside the nipg36 container, where home is
+mounted at `/home/csengehubay`. A venv hardcodes its interpreter's absolute path,
+and that path **does not exist on nipg1 or any compute node** (home is
+`/nas/home/csengehubay-1000257` there), so `.venv/bin/python` is a dangling
+symlink everywhere except nipg36. Rebuild both venvs from nipg1 before running
+the server anywhere else:
+
+```bash
+./scripts/setup_server.sh          # plus the .venv-cut3r steps in run_deep3r.sh
+```
 
 ---
 
@@ -639,13 +711,15 @@ link/                    everything crossing the robot <-> cluster boundary
   ssh_config             host aliases; the wrapper reads this directly
   ros-env.sh             ROS env sourced on the robot
   mecanumbot-tunnel.service       reverse tunnel: robot:22 -> nipg1:8200
-  mecanumbot-deep3r-tunnel.service forward tunnel: robot:5555 -> nipg36:5555
+  mecanumbot-deep3r-tunnel.service forward tunnel: robot:5555 -> nipg1:5555
   netcheck.sh            can the robot reach the server?
 config/server.yaml
 scripts/                 setup_server.sh, run_server.sh, run_deep3r.sh
+  run_deep3r_bridged.sh  cluster-side half of the data path: server + the
+                         reverse tunnel to the rendezvous on nipg1
 .venv/                   server only (numpy 2.x)
 .venv-cut3r/             server + torch + CUT3R (numpy 1.26.4)
-tests/                   32 tests, including real sockets end to end
+tests/                   200 tests, including real sockets end to end
 ```
 
 `waker.py` earns its place: without it a finished result waits for the current
@@ -665,9 +739,11 @@ quantisation, and the state machine that decides when a map ends — is plain
 numpy, and that is where a bug corrupts a map quietly. Keeping it testable
 without weights is what lets it be checked on a laptop.
 
-`tests/test_config.py::test_missing_file` fails on this filesystem: it expects
-`FileNotFoundError` for `/nonexistent/server.yaml` and gets `PermissionError`.
-That is the environment, not the code.
+`tests/test_config.py::test_missing_file` used to be noted here as a known
+failure — it expects `FileNotFoundError` for `/nonexistent/server.yaml` and got
+`PermissionError`. That was specific to nipg36's container filesystem. On nipg1
+the whole suite is green: **195 passed, 5 skipped** (2026-09-01), the skips being
+`test_deep3r_gpu.py`, which needs torch and so only runs in `.venv-cut3r`.
 
 `tests/test_loopback.py` runs a real server on a real TCP socket and talks to it
 both with a bare DEALER (to exercise the protocol directly) and with the actual

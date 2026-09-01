@@ -5,12 +5,21 @@
 # "the stream does not work" problems are a firewall or a wrong address, and
 # this tells the two apart in a few seconds.
 #
-#   ./netcheck.sh                       # defaults to nipg36 on the LAN
-#   ./netcheck.sh 10.128.17.196 5555
+#   ./netcheck.sh                       # the local end of the tunnel (normal)
+#   ./netcheck.sh nipg1.inf.elte.hu 22  # is the rendezvous host reachable?
+#
+# The default is 127.0.0.1 on purpose. The robot never dials a cluster address:
+# it is behind the lab router's NAT, so mecanumbot-deep3r-tunnel.service dials
+# out to nipg1 and forwards the server's port back to the robot's loopback. So
+# the question that matters is "is the tunnel up and is something behind it",
+# and 127.0.0.1:5555 is where that gets answered.
+#
+# Testing 10.128.17.196 (nipg36's LAN address) was the old default and is a
+# false lead: it is unreachable from the robot and always was.
 
 set -uo pipefail
 
-HOST="${1:-10.128.17.196}"
+HOST="${1:-127.0.0.1}"
 PORT="${2:-5555}"
 
 echo "=== target: ${HOST}:${PORT} ==="
@@ -57,13 +66,31 @@ echo
 
 if [[ $RC -ne 0 ]]; then
     cat <<EOF
-Things to check, in order:
-  1. Is the server actually running?   ssh into nipg36 and look for the
-     "listening on tcp://0.0.0.0:${PORT}" line.
-  2. Is ${HOST} the right address? Run 'hostname -I' on nipg36.
-  3. Are you off the university network? Then the LAN address is unreachable
-     and you need the VPN, or the SSH reverse tunnel described in the README.
-  4. Host firewall on the server (needs an admin: sudo ufw status).
+Things to check, in order — the path is
+robot:${PORT} -> nipg1:${PORT} -> compute node:${PORT} (server), so work along it:
+
+  1. Is the robot's tunnel up?
+       systemctl status mecanumbot-deep3r-tunnel     (or --user)
+     It restarts every 10 s when nothing is bridged on nipg1, which is the
+     normal look of "no server allocated right now", not a fault.
+
+  2. Is a job bridged to nipg1? On nipg1:
+       squeue -u \$USER
+       ss -ltn | grep ${PORT}      # the rendezvous port should be LISTEN
+     If squeue is empty, allocate one and run scripts/run_deep3r_bridged.sh.
+
+  3. Is the server itself up inside that job? Its output has
+     "listening on tcp://0.0.0.0:${PORT}" once the model has loaded. The 512
+     DPT checkpoint takes tens of seconds, so a fresh job is briefly normal
+     to fail this check.
+
+  4. Stale port: if a previous job's forward still holds ${PORT} on nipg1,
+     the new job's tunnel cannot bind and exits. 'ss -ltnp | grep ${PORT}'
+     on nipg1 finds it; kill it, or use DEEP3R_BRIDGE_PORT on both ends.
+
+Note none of this involves reaching a cluster address from the robot. If you
+are testing 10.128.17.196 or any other 10.128.17.x address, that is the old
+(and always mistaken) idea of how this works — see link/README.md.
 EOF
 fi
 

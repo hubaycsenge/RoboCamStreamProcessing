@@ -3,9 +3,9 @@
 #
 #   ./scripts/run_server.sh --processor noop --log-level DEBUG
 #
-# GPU note: nipg36 has two TITAN RTX cards and GPU 0 is usually occupied by
-# another user, so we default to GPU 1. Override with CUDA_VISIBLE_DEVICES.
-# This has no effect today (no models loaded) but keeps the habit in place.
+# GPU note: we default to GPU 1, a habit from nipg36 (two TITAN RTX, GPU 0
+# usually occupied by another user). Override with CUDA_VISIBLE_DEVICES. This
+# has no effect today (no models loaded) but keeps the habit in place.
 
 set -euo pipefail
 
