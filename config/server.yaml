@@ -67,6 +67,10 @@ processor:
     # reset_on_gap: 0     # seq jump forcing a reset; 0 = 4 * every_n
     # colors: true
     # lidar_check: true   # compare CUT3R's metric scale against the LiDAR
+    # compare_map: true   # diff each cloud against the robot's uploaded grid.
+    #                     # The geometry it needs is in the "compare" section
+    #                     # below, not here: it describes the robot rather than
+    #                     # the model, and two copies could disagree.
 
 lidar:
   # The robot's LDS-02: 360 points a revolution, ~5 Hz, 0.12-12 m, one
@@ -124,6 +128,146 @@ imu:
   # LiDAR's window because the IMU runs 20x faster: inertial data 150 ms old
   # means something is broken, not merely slow.
   stale_after_ms: 150.0
+
+odom:
+  # The robot's pose, sent once per frame or so. The smallest message on this
+  # link and the one with the most leverage: it is what lets the server put a
+  # reconstruction where the robot's map is. Without it the cloud stays in the
+  # model's own arbitrary world frame, which nothing on the robot can merge.
+  enabled: true
+
+  # THE field to get right. "map" is SLAM's frame, the one the occupancy grid is
+  # drawn in. "odom" is dead reckoning -- smooth, continuous, and wrong by
+  # however much the wheels have slipped. Comparing a cloud placed with an
+  # odom-frame pose against a map-frame grid finds differences everywhere and
+  # calls them furniture, so the server refuses rather than absorbing it.
+  # Empty accepts whatever arrives and leaves the check to the comparison.
+  expect_frame: map
+
+  # A pose older than this is not attached to a frame. Between the LiDAR's
+  # window and the IMU's: at this robot's cruising speed 200 ms is ~6 cm, about
+  # one map cell, which is the error budget for placing a cloud.
+  stale_after_ms: 200.0
+
+  # Below these the robot counts as still. Reported only -- it is what tells a
+  # reader of the log that a frame gave the reconstruction no new parallax.
+  still_speed_ms: 0.02
+  still_yaw_rate_dps: 2.0
+
+map:
+  # The robot's 2D occupancy grid, uploaded every few seconds. This is the
+  # shared object in the middle of the system diagram: SLAM draws it, Nav2
+  # drives on it, the server's compare diffs the reconstruction against it, and
+  # what that finds goes back into it.
+  enabled: true
+
+  # 4 million cells is a 1 km square at 5 cm. Checked before the allocation it
+  # would drive, which is the only ordering that helps against a corrupt width.
+  max_cells: 4000000
+
+  # A grid this old is still used. Deliberately generous: a room does not change
+  # in ten seconds, whereas the robot's pose in it does.
+  stale_after_ms: 10000.0
+
+  # Send patches back to the robot. Turning this off leaves the comparison
+  # running and reported in the log -- the way to see what the server WOULD
+  # write to the costmap before letting it. --no-map-updates does the same.
+  send_updates: true
+
+  # Smallest patch worth a message. Below this the news is single-frame
+  # reconstruction noise more often than it is furniture, and a costmap full of
+  # specks is worse than one missing a table.
+  min_update_cells: 4
+
+  # Value written into cells the comparison newly calls occupied. 100 is
+  # "certainly occupied" on the ROS scale; lower it to let the robot's own
+  # inflation treat the camera's evidence as weaker than its scanner's.
+  occupied_value: 100
+
+  # How the robot should merge a patch. "max" may add obstacles and fill in
+  # unknown cells but may never clear an observed one -- which is what makes the
+  # server safe to be wrong. Its evidence is a monocular reconstruction: when it
+  # errs it invents a surface, and an invented obstacle costs a detour. The
+  # opposite policy would let a missing surface clear a wall the scanner saw,
+  # and that costs a collision. "replace" needs a reason.
+  merge: max
+
+  # At most one patch per this interval. The reconstruction produces several
+  # clouds a second; the robot's costmap does not need rewriting at that rate.
+  min_update_interval_ms: 500.0
+
+compare:
+  # The Compare box: the reconstruction against the robot's own grid. What it is
+  # for is the LDS-02's blind spot -- one horizontal plane at the height the
+  # scanner is bolted at, which cannot see a table top, a shelf edge, a
+  # windowsill or the tray of a trolley, all of which a robot with a mast hits.
+  enabled: true
+
+  # --- the height slice, metres above the map's floor plane ---
+  # Above the floor (the largest surface any indoor reconstruction produces, and
+  # not an obstacle) and below anything the robot passes under.
+  z_min: 0.05
+  z_max: 1.6
+  # Points needed in a cell before it counts as a surface. One is a pixel of a
+  # monocular depth estimate; three in a 5 cm cell is a patch of something real.
+  min_points: 3
+
+  # --- where the camera is bolted, in the base frame: x forward, y left, z up ---
+  # Tape-measure facts about YOUR robot, and the failure they cause is the quiet
+  # kind: a camera height 10 cm wrong puts every reconstructed surface 10 cm off
+  # in z, which moves a table top out of the slice above and produces a
+  # comparison that runs perfectly and finds nothing.
+  #
+  # On this robot the camera is on a neck motor, so camera_pitch is whatever the
+  # neck is commanded to; these defaults describe it looking level.
+  camera_x: 0.10
+  camera_y: 0.0
+  camera_z: 0.45
+  camera_roll: 0.0
+  camera_pitch: 0.0
+  camera_yaw: 0.0
+
+  # --- the pose hint (the dotted arrow to SLAM) ---
+  # Offer SLAM a correction when the cloud agrees with the map better at an
+  # offset than at zero. OFF by default and deliberately so: it is an inference
+  # from a histogram offered to a robot that has a pose graph. Switch it on once
+  # data.compare.agreement has been seen to be healthy -- an agreement near zero
+  # means the placement is broken, and a hint derived from it would be too.
+  send_hints: false
+  # Half-width of the offset search in cells. 4 at 5 cm is +/-20 cm, the drift
+  # this is meant to catch. Wider mostly buys chances to lock onto a corridor
+  # wall at the wrong offset.
+  search_cells: 4
+  # A correction the robot has not had time to apply will only be measured again.
+  min_hint_interval_ms: 2000.0
+
+mission:
+  # The two rows of the system diagram.
+  #   t1  explore and map: compare is live, exits are ranked
+  #   t2  seek: the robot navigates its own map and the decision stage watches
+  #       the same frames for the target
+  # The robot's hello wins over this; this is the default for a client with no
+  # opinion, which is every protocol-1 client.
+  phase: t1
+
+  # What t2 is looking for, in words. Free text: it is the prompt for whatever
+  # runs the decision stage, so "the red mug on the desk" beats "mug". Normally
+  # empty here and declared by the robot -- the mission belongs to the run.
+  target: ""
+
+  # Rank the exit candidates the robot uploads and answer with an ordering.
+  rank_exits: true
+  # Narrowest gap the ranking will recommend. The Mecanumbot is 28 cm across the
+  # wheels; 60 cm leaves room for the fact that a frontier width is measured on
+  # a grid rather than with calipers.
+  min_exit_width_m: 0.6
+  # Metres per radian charged against an exit for having to turn to face it. A
+  # tie-breaker at this robot's driving and turning speeds, not a model.
+  turn_cost_m_per_rad: 0.5
+  # How far short of the target the approach pose in a "found" stops. The
+  # robot's reach plus its radius: driving to the target's own coordinates means
+  # driving into it.
+  approach_standoff_m: 0.8
 
 snapshot:
   # Periodically write a decoded frame to disk so you can confirm from your

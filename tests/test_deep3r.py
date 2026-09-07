@@ -416,3 +416,171 @@ def test_scale_check_is_absent_when_the_scan_saw_nothing():
     f = frame(0)
     f.scan = FakeScan(front_min_m=None, nearest_m=None)
     assert proc._scale_check(f, np.zeros((3, 3)), np.ones(3)) is None
+
+
+# -- the comparison against the robot's map ----------------------------------
+#
+# The production path, exercised without torch: _compare_with_map takes points
+# and a pose and needs no model to do so.  The stub processor in test_loopback
+# covers the server's half of the same journey; this covers deep3r's.
+
+
+def a_configured_proc(**overrides):
+    """A processor with the server config applied, as configure() would."""
+    from robocam.config import Config
+
+    cfg = Config()
+    for section, values in overrides.items():
+        for key, value in values.items():
+            setattr(getattr(cfg, section), key, value)
+    proc = make_proc()
+    proc.configure(cfg.lidar, cfg.imu, cfg)
+    return proc
+
+
+def a_mapped_room(width=80, height=80):
+    from robocam.occupancy import Grid
+
+    cells = np.zeros((height, width), dtype=np.int8)
+    cells[0, :] = 100
+    cells[-1, :] = 100
+    cells[:, 0] = 100
+    cells[:, -1] = 100
+    return Grid(cells=cells, resolution=0.05, origin=(0.0, 0.0, 0.0),
+                frame="map", map_id="m1")
+
+
+def a_frame_with_a_map(**kwargs):
+    from robocam.odometry import Odom
+
+    f = frame(0)
+    f.grid = a_mapped_room()
+    f.odom = Odom(x=0.5, y=2.0, yaw=0.0, frame="map")
+    for key, value in kwargs.items():
+        setattr(f, key, value)
+    return f
+
+
+def a_table_in_optical_coordinates(f, proc):
+    """A 40 cm table top at 75 cm, expressed in the model's own frame."""
+    import math
+
+    xs, ys = np.meshgrid(np.linspace(1.8, 2.2, 20), np.linspace(1.8, 2.2, 20))
+    table = np.column_stack([xs.ravel(), ys.ravel(), np.full(xs.size, 0.75)])
+
+    mount = proc._mount.matrix()
+    c, s = math.cos(f.odom.yaw), math.sin(f.odom.yaw)
+    t_map_base = np.eye(4)
+    t_map_base[:3, :3] = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    t_map_base[:3, 3] = (f.odom.x, f.odom.y, f.odom.z)
+    t_map_cam = t_map_base @ mount
+    return (table - t_map_cam[:3, 3]) @ t_map_cam[:3, :3]
+
+
+def test_configure_takes_the_camera_mount_from_the_server_config():
+    """It describes the robot, not the model, so it must not live in options."""
+    proc = a_configured_proc(compare={"camera_z": 0.62, "camera_pitch": 0.1})
+    assert proc._mount.z == 0.62
+    assert proc._mount.pitch == 0.1
+
+
+def test_a_processor_configured_with_nothing_keeps_working():
+    """configure(None) is what every test and every old caller passes."""
+    proc = make_proc()
+    proc.configure(None, None, None)
+    assert proc._compare_cfg is None
+    assert proc._compare_with_map(a_frame_with_a_map(), np.zeros((1, 3)),
+                                  np.eye(4))["ran"] is False
+
+
+def test_the_comparison_says_why_it_could_not_run():
+    """Three situations that produce the same silence, told apart in one field.
+
+    Without this, "no map on the server", "no pose to place the cloud with" and
+    "compared and found nothing" are indistinguishable from the robot.
+    """
+    proc = a_configured_proc()
+
+    no_map = a_frame_with_a_map()
+    no_map.grid = None
+    assert "occupancy grid" in proc._compare_with_map(no_map, np.zeros((1, 3)),
+                                                     np.eye(4))["why"]
+
+    no_pose = a_frame_with_a_map()
+    no_pose.odom = None
+    assert "pose" in proc._compare_with_map(no_pose, np.zeros((1, 3)),
+                                            np.eye(4))["why"]
+
+    empty = a_frame_with_a_map()
+    assert "confidence filter" in proc._compare_with_map(
+        empty, np.zeros((0, 3)), np.eye(4))["why"]
+
+
+def test_the_comparison_announces_a_patch_for_a_table_the_scanner_missed():
+    """deep3r's half of the map loop, end to end and without a model."""
+    proc = a_configured_proc(compare={"min_points": 1, "camera_z": 0.5,
+                                      "camera_x": 0.0})
+    f = a_frame_with_a_map()
+    points = a_table_in_optical_coordinates(f, proc)
+
+    stats = proc._compare_with_map(f, points, np.eye(4))
+
+    assert stats["ran"] is True
+    assert stats["new_cells"] > 20
+    assert len(f.announcements) == 1
+    header, payload = f.announcements[0]
+    assert header["type"] == "map_update"
+    assert header["map_id"] == "m1"
+    assert header["merge"] == "max"
+    assert header["cells_changed"] == stats["new_cells"]
+    # seq is left at 0 for the server to stamp: the counters are per session and
+    # a worker thread has no business allocating them.
+    assert header["seq"] == 0
+    assert len(payload) > 0
+
+
+def test_nothing_is_announced_when_the_frames_do_not_match():
+    """The refusal, from inside the processor rather than only in compare()."""
+    from robocam.odometry import Odom
+
+    proc = a_configured_proc(compare={"min_points": 1})
+    f = a_frame_with_a_map()
+    f.odom = Odom(x=0.5, y=2.0, yaw=0.0, frame="odom")
+    points = np.tile([0.0, 0.0, 2.0], (50, 1))
+
+    stats = proc._compare_with_map(f, points, np.eye(4))
+
+    assert stats["ran"] is False
+    assert "refusing to compare across frames" in stats["error"]
+    assert f.announcements == []
+
+
+def test_no_hint_is_announced_when_hints_are_off():
+    proc = a_configured_proc(compare={"min_points": 1, "camera_z": 0.5,
+                                      "camera_x": 0.0, "send_hints": False})
+    f = a_frame_with_a_map()
+    proc._compare_with_map(f, a_table_in_optical_coordinates(f, proc), np.eye(4))
+    assert all(h["type"] != "pose_hint" for h, _ in f.announcements)
+
+
+def test_the_cloud_carries_a_pointcloud2_layout():
+    """So the robot need not hardcode one that could then drift out of step."""
+    proc = make_proc(colors=True)
+    pts = np.random.default_rng(0).uniform(-1, 1, size=(30, 3))
+    cloud = proc._encode_cloud(pts, np.zeros((30, 3), np.uint8), np.full(30, 5.0))
+
+    pc2 = cloud["pc2"]
+    assert pc2["height"] == 1 and pc2["width"] == cloud["n_points"]
+    assert pc2["point_step"] == 16
+    assert [f["name"] for f in pc2["fields"]] == ["x", "y", "z", "rgb"]
+    assert [f["offset"] for f in pc2["fields"]] == [0, 4, 8, 12]
+    # is_dense, because non-finite points were filtered out rather than kept.
+    assert pc2["is_dense"] is True
+
+
+def test_a_colourless_cloud_declares_a_shorter_point():
+    proc = make_proc(colors=False)
+    pts = np.random.default_rng(0).uniform(-1, 1, size=(30, 3))
+    cloud = proc._encode_cloud(pts, None, np.full(30, 5.0))
+    assert cloud["pc2"]["point_step"] == 12
+    assert [f["name"] for f in cloud["pc2"]["fields"]] == ["x", "y", "z"]

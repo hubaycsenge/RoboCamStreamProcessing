@@ -20,7 +20,7 @@ import queue
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from .processors import Processor
@@ -41,6 +41,11 @@ class ProcessedResult:
     data: Dict[str, Any]
     process_ms: float
     queue_ms: float
+    # Unsolicited messages the processor produced while handling this frame —
+    # map_update, pose_hint, found.  Carried alongside the result rather than
+    # inside it because they are separate messages to the robot, and because a
+    # frame that failed may still have announced something before it failed.
+    announcements: List[Tuple[Dict[str, Any], bytes]] = field(default_factory=list)
 
 
 class FrameQueue:
@@ -191,6 +196,11 @@ class WorkerPool:
                         data=data,
                         process_ms=process_ms,
                         queue_ms=queue_ms,
+                        # Taken even from a frame that raised: a processor that
+                        # announced a map patch and then failed on something
+                        # unrelated has still produced the patch, and dropping
+                        # it would lose work the robot is waiting for.
+                        announcements=list(frame.announcements),
                     )
                 )
                 if self._notify is not None:

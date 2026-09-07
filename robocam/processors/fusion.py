@@ -75,13 +75,15 @@ class FusionProcessor(Processor):
         self._frames = 0
         self._frames_with_scan = 0
 
-    def configure(self, lidar_cfg: Any, imu_cfg: Any = None) -> None:
+    def configure(self, lidar_cfg: Any, imu_cfg: Any = None, config: Any = None) -> None:
         """Adopt the server's LiDAR geometry for anything not set explicitly.
 
         The IMU config is not consulted: everything this processor says about
         attitude comes from the summary the IO thread already computed with those
         same thresholds, so re-deriving it here could only produce a second
-        answer to a question that already has one.
+        answer to a question that already has one.  Nor is ``config``: this
+        processor projects a scan into an image and has nothing to say about the
+        map.
         """
         if not self._explicit["hfov_deg"]:
             self.hfov_deg = float(lidar_cfg.camera_hfov_deg)

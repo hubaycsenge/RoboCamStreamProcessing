@@ -23,7 +23,8 @@
 # reach it. Earlier versions of this comment claimed the job "has to be nipg36",
 # because nipg36 is the only node with a 10.128.17.x address and that was
 # believed to be the robot's network. Both halves were wrong: the robot is on
-# lab WiFi at 192.168.1.240, and 10.128.17.196 is routed from nipg1 anyway. What
+# lab WiFi at 192.168.0.240 or 192.168.1.240 (whichever of the two lab routers
+# it associated with), and 10.128.17.196 is routed from nipg1 anyway. What
 # is true (measured 2026-08-28, see link/README.md) is that the robot cannot
 # reach *any* cluster node's ZeroMQ port directly -- it is behind the lab
 # router's NAT and has to dial out over SSH.

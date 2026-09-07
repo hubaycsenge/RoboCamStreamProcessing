@@ -16,6 +16,7 @@ same SSH plumbing, so both live here.
 | `mecanumbot-tunnel.service` | control | robot:22 → nipg1:8200, robot-side systemd |
 | `mecanumbot-deep3r-tunnel.service` | data | robot:5555 → nipg1:5555, robot-side systemd |
 | `netcheck.sh` | data | can the robot actually reach the server? |
+| `robot-addr.sh` | setup | which of the two lab subnets the robot is on today |
 
 The cluster-side half of the data path lives in `../scripts/run_deep3r_bridged.sh`
 — it runs inside the Slurm job and forwards the server back to nipg1.
@@ -36,11 +37,31 @@ from the hosts named:
 | nipg1 | `nipg36:22` | **connection refused** | 09-01 |
 | nipg3 (Slurm job) | `nipg1:22` | reachable | 09-01 |
 
-The robot is on the lab WiFi at **192.168.1.240** (earlier notes said
-`192.168.0.240`; that subnet is stale). nipg1 is on the public university
-subnet at `157.181.160.161`; nipg36's `10.128.17.x` address is private to the
-cluster, though *routed* from nipg1 rather than isolated from it — the last
-three rows are why the data path no longer goes anywhere near nipg36.
+The robot is on the lab WiFi, at **`192.168.0.240` or `192.168.1.240`
+depending on which router it associated with** — the lab has two, and they hand
+out different subnets:
+
+| router | robot |
+| --- | --- |
+| `192.168.0.1` | `192.168.0.240` |
+| `192.168.1.1` | `192.168.1.240` |
+
+The last octet is fixed by a DHCP reservation, so only the third changes; the
+robot is always `.240`. An earlier version of this file called `192.168.0.240`
+"stale", which was wrong — it is the address on the other router, not a
+historical one, and treating it as dead is what makes a working robot look
+unreachable after someone moves it between rooms. `link/robot-addr.sh` probes
+both and prints whichever answers.
+
+Nothing else in this directory depends on which it is: both tunnels are opened
+*by the robot*, so the robot's own address never has to be known from outside.
+The one place it does matter is the laptop ad-hoc tunnel in step 3 of the setup
+below, which has to name the robot to forward to it.
+
+nipg1 is on the public university subnet at `157.181.160.161`; nipg36's
+`10.128.17.x` address is private to the cluster, though *routed* from nipg1
+rather than isolated from it — the last three rows are why the data path no
+longer goes anywhere near nipg36.
 
 Four facts follow, and they shape everything here:
 
@@ -77,7 +98,7 @@ Four facts follow, and they shape everything here:
    streams the result back — local in feel, remote in mechanism.
 
 ```
-  you @ nipg1                              Mecanumbot (192.168.1.240)
+  you @ nipg1                          Mecanumbot (192.168.{0,1}.240)
   ───────────                              ──────────────────────────
   robot topic list ──ssh nipg1:8200──▶ sshd ──▶ ros2 topic list
                    ◀───── stdout ──────────────────  (DOMAIN_ID 19, cyclonedds)
@@ -122,8 +143,16 @@ and can go.
 
 Steps 1–2 are on nipg1; step 3 is on the robot and needs its sudo. The robot
 must be reachable to do step 3 the first time — easiest via a laptop ad-hoc
-tunnel (`ssh -R 8222:192.168.1.240:22 csengehubay@nipg1...`), which the
-`mecanumbot-laptop` host alias targets.
+tunnel from a machine on the same WiFi, which the `mecanumbot-laptop` host alias
+targets:
+
+    ssh -R 8222:"$(./robot-addr.sh)":22 csengehubay@nipg1.inf.elte.hu
+
+`robot-addr.sh` prints whichever of `192.168.0.240` / `192.168.1.240` answers,
+so the command is the same in both rooms. Hard-coding one of them is the
+mistake this script exists to prevent: the failure is `channel 2: open failed:
+administratively prohibited`, which reads like a permissions problem on nipg1
+and is actually a laptop on the other router.
 
 **1. Authorize the robot's key on nipg1** (forwarding-only, no shell):
 
@@ -204,7 +233,9 @@ Run them as user services with linger (one sudo, for linger only):
 
 - ROS 2 Humble; `ROS_DOMAIN_ID=19`; `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`.
 - Workspace overlay: `~/mecanumbot_ws/install/setup.bash`.
-- WiFi address `192.168.1.240` on `wlP1p1s0`.
+- WiFi address `192.168.0.240` **or** `192.168.1.240` on `wlP1p1s0`, depending
+  on which lab router it associated with (`.0.1` and `.1.1` respectively). Last
+  octet reserved, so only the third octet moves.
 - Accessory command: `/cmd_accessory_pos`, type `mecanumbot_msgs/msg/AccessMotorCmd`
   = `{float32 n_pos, float32 gl_pos, float32 gr_pos}`.
 - Neck range 2.0–8.6; gripper range 1.6–8.54; neutral/"front" 5.12.

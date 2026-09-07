@@ -18,9 +18,46 @@ import numpy as np
 import pytest
 import zmq
 
-from robocam import lidar, wire
+from robocam import lidar, occupancy, processors, wire
 from robocam.config import Config
+from robocam.processors.base import Frame, Processor
 from robocam.server import StreamServer
+
+
+class _AnnouncingProcessor(Processor):
+    """A processor that announces a map patch on every frame.
+
+    Stands in for deep3r in the tests of the unsolicited path.  What is under
+    test there is the *server's* wiring — the sequence numbers it stamps, the
+    enable switches, the map_id check and the ordering against the frame's own
+    result — and none of that involves a model, weights or a GPU.
+    """
+
+    name = "pytest-announcer"
+
+    def __init__(self, map_id: str = "", **options):
+        super().__init__(map_id=map_id, **options)
+        self.map_id = map_id
+
+    def process(self, frame: Frame):
+        if frame.grid is None:
+            return {"announced": False}
+        patch = np.full((2, 2), 100, dtype=np.int8)
+        frame.announce(
+            wire.map_update(
+                seq=0, width=2, height=2, resolution=frame.grid.resolution,
+                x0=5, y0=5, origin=frame.grid.origin, frame=frame.grid.frame,
+                # An explicit map_id override is how the stale-patch case is
+                # provoked without racing a real SLAM reset.
+                map_id=self.map_id or frame.grid.map_id,
+                cells_changed=4, from_frame_seq=frame.seq,
+            ),
+            occupancy.encode_cells(patch, wire.MAP_ENC_I8_ZLIB),
+        )
+        return {"announced": True}
+
+
+processors.register("pytest-announcer", _AnnouncingProcessor)
 
 # The client is deployed to the robot as a standalone file, so it is not on the
 # package path; add its directory explicitly.
@@ -60,6 +97,47 @@ def server():
         yield running
 
 
+@pytest.fixture
+def server_no_odom():
+    with running_server(odom={"enabled": False}) as running:
+        yield running
+
+
+@pytest.fixture
+def server_no_map():
+    with running_server(map={"enabled": False}) as running:
+        yield running
+
+
+@pytest.fixture
+def server_tiny_map():
+    with running_server(map={"max_cells": 2000}) as running:
+        yield running
+
+
+@pytest.fixture
+def server_announcer():
+    with running_server(processor={"name": "pytest-announcer", "options": {}}) as running:
+        yield running
+
+
+@pytest.fixture
+def server_announcer_stale():
+    with running_server(
+        processor={"name": "pytest-announcer", "options": {"map_id": "gone"}},
+    ) as running:
+        yield running
+
+
+@pytest.fixture
+def server_announcer_muted():
+    with running_server(
+        processor={"name": "pytest-announcer", "options": {}},
+        map={"send_updates": False},
+    ) as running:
+        yield running
+
+
 def jpeg(width: int, height: int) -> bytes:
     img = np.random.randint(0, 255, (height, width, 3), dtype=np.uint8)
     ok, buf = cv2.imencode(".jpg", img)
@@ -94,11 +172,32 @@ class RawPeer:
         header.update(overrides)
         self.send(header, lidar.encode_scan_payload(ranges_m))
 
+    def send_map(self, seq: int, cells, **overrides):
+        header = wire.occupancy_map(
+            seq=seq, width=cells.shape[1], height=cells.shape[0],
+            resolution=0.05, t_capture_ns=seq, origin=(0.0, 0.0, 0.0),
+            frame="map", map_id="m1", source="pytest",
+        )
+        header.update(overrides)
+        payload = occupancy.encode_cells(
+            cells, header.get("encoding", wire.MAP_ENC_I8_ZLIB))
+        self.send(header, payload)
+
+    def send_odom(self, seq: int, x=0.0, y=0.0, yaw=0.0, **overrides):
+        header = wire.odom(seq=seq, t_capture_ns=seq, x=x, y=y, yaw=yaw,
+                           frame="map", source="pytest")
+        header.update(overrides)
+        self.send(header)
+
     def recv(self, timeout_ms: int = 3000):
+        return self.recv_full(timeout_ms)[0]
+
+    def recv_full(self, timeout_ms: int = 3000):
+        """Header and payload.  Only ``map_update`` uses the second frame."""
         if not self.sock.poll(timeout_ms):
             raise TimeoutError("no reply from server")
         parts = self.sock.recv_multipart()
-        return json.loads(parts[0].decode())
+        return json.loads(parts[0].decode()), (parts[1] if len(parts) > 1 else b"")
 
     def recv_of_type(self, mtype: str, timeout_ms: int = 3000):
         """Next message of a given type, skipping the other stream's replies."""
@@ -543,3 +642,385 @@ def test_real_client_against_real_server(server):
     assert first["rtt_ms"] > 0
     # JPEG should be well under the raw size.
     assert first["payload_bytes"] < first["nbytes"]
+
+
+# ---------------------------------------------------------------------------
+# Odometry, the map, exits and the phase — the right-hand column of the diagram
+# ---------------------------------------------------------------------------
+
+
+def a_room(width=40, height=40):
+    """A small mapped room: walls occupied, interior swept free."""
+    cells = np.zeros((height, width), dtype=np.int8)
+    cells[0, :] = 100
+    cells[-1, :] = 100
+    cells[:, 0] = 100
+    cells[:, -1] = 100
+    return cells
+
+
+def test_a_pose_is_answered(server):
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"odom-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send_odom(0, x=1.0, y=2.0, yaw=0.5)
+    reply = peer.recv_of_type(wire.MSG_ODOM_RESULT)
+    assert reply["ok"] and reply["seq"] == 0
+    assert reply["data"]["x"] == 1.0
+    # No grid has been uploaded, so nothing can be compared and the reply says
+    # which of the three preconditions is missing rather than staying silent.
+    assert reply["data"]["usable_for_compare"] is False
+    assert "no occupancy grid" in reply["data"]["frame_warning"]
+
+
+def test_a_pose_in_the_wrong_frame_is_flagged_on_every_pose(server):
+    """The mistake that otherwise shows up only as a map that never improves."""
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"frame-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send_odom(0, frame="odom")
+    reply = peer.recv_of_type(wire.MSG_ODOM_RESULT)
+    assert reply["ok"]
+    assert "dead reckoning" in reply["data"]["frame_warning"]
+
+
+def test_a_broken_pose_is_refused_without_killing_the_session(server):
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"badodom-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send_odom(0, x=float("inf"))
+    bad = peer.recv_of_type(wire.MSG_ODOM_RESULT)
+    assert not bad["ok"] and bad["reason"] == wire.REASON_BAD_ODOM
+
+    peer.send_odom(1, x=1.0)
+    assert peer.recv_of_type(wire.MSG_ODOM_RESULT)["ok"]
+
+
+def test_odom_can_be_disabled(server_no_odom):
+    _, endpoint = server_no_odom
+    peer = RawPeer(endpoint, b"noodom-peer")
+    peer.send(wire.hello("pytest"))
+    welcome = peer.recv_of_type(wire.MSG_WELCOME)
+    assert welcome["server"]["odom"]["enabled"] is False
+
+    peer.send_odom(0)
+    reply = peer.recv_of_type(wire.MSG_ODOM_RESULT)
+    assert not reply["ok"] and reply["reason"] == wire.REASON_ODOM_DISABLED
+
+
+def test_a_grid_is_accepted_and_summarised(server):
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"map-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send_map(0, a_room())
+    reply = peer.recv_of_type(wire.MSG_MAP_RESULT)
+    assert reply["ok"]
+    assert reply["cells"] == 1600
+    assert reply["data"]["occupied"] == 156        # the four walls, corners once
+    assert reply["data"]["explored_fraction"] == 1.0
+    # No pose has arrived, so there is nothing to compare with; saying which
+    # precondition is missing is the difference between "not comparing" and
+    # "comparing and finding nothing".
+    assert reply["data"]["compare_ready"] is False
+    assert "no fresh pose" in reply["data"]["compare_blocked_by"]
+
+
+def test_a_grid_and_a_pose_together_are_compare_ready(server):
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"ready-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send_odom(0, x=1.0, y=1.0)
+    peer.recv_of_type(wire.MSG_ODOM_RESULT)
+    peer.send_map(0, a_room())
+    assert peer.recv_of_type(wire.MSG_MAP_RESULT)["data"]["compare_ready"] is True
+
+
+def test_a_patch_from_the_robot_replaces_rather_than_maxes(server):
+    """The robot's own patches are its map, not an opinion about it.
+
+    It may legitimately clear a cell it has re-observed as free, which is exactly
+    what the server must *not* do in the other direction.
+    """
+    srv, endpoint = server
+    peer = RawPeer(endpoint, b"patch-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send_map(0, a_room())
+    peer.recv_of_type(wire.MSG_MAP_RESULT)
+
+    cleared = np.zeros((3, 3), dtype=np.int8)
+    peer.send_map(1, cleared, full=False, x0=0, y0=0)
+    reply = peer.recv_of_type(wire.MSG_MAP_RESULT)
+    assert reply["ok"]
+    assert reply["data"]["patch_applied_cells"] == 5   # the wall corner inside 3x3
+
+    session = next(iter(srv.sessions.values()))
+    assert session.grid.cells[0, 0] == 0
+
+
+def test_a_patch_before_any_full_grid_is_refused(server):
+    """Its x0/y0 place it inside a map the server has never seen."""
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"orphan-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send_map(0, np.zeros((3, 3), dtype=np.int8), full=False, x0=5, y0=5)
+    reply = peer.recv_of_type(wire.MSG_MAP_RESULT)
+    assert not reply["ok"] and reply["reason"] == wire.REASON_BAD_MAP
+    assert "before any full grid" in reply["data"]["error"]
+
+
+def test_a_patch_for_a_different_map_id_is_refused(server):
+    """SLAM restarted; the patch names coordinates in a map that is gone."""
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"mapid-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send_map(0, a_room())
+    peer.recv_of_type(wire.MSG_MAP_RESULT)
+    peer.send_map(1, np.zeros((3, 3), dtype=np.int8), full=False, map_id="m2")
+    reply = peer.recv_of_type(wire.MSG_MAP_RESULT)
+    assert not reply["ok"]
+    assert "map_id" in reply["data"]["error"]
+
+
+def test_a_grid_over_the_cell_limit_is_refused_by_reason(server_tiny_map):
+    _, endpoint = server_tiny_map
+    peer = RawPeer(endpoint, b"big-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send_map(0, a_room(100, 100))
+    reply = peer.recv_of_type(wire.MSG_MAP_RESULT)
+    assert not reply["ok"] and reply["reason"] == wire.REASON_MAP_TOO_LARGE
+
+
+def test_the_map_can_be_disabled(server_no_map):
+    _, endpoint = server_no_map
+    peer = RawPeer(endpoint, b"nomap-peer")
+    peer.send(wire.hello("pytest"))
+    welcome = peer.recv_of_type(wire.MSG_WELCOME)
+    assert welcome["server"]["map"]["enabled"] is False
+
+    peer.send_map(0, a_room())
+    reply = peer.recv_of_type(wire.MSG_MAP_RESULT)
+    assert not reply["ok"] and reply["reason"] == wire.REASON_MAP_DISABLED
+
+
+def test_exits_come_back_ranked(server):
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"exit-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send_odom(0, x=0.0, y=0.0, yaw=0.0)
+    peer.recv_of_type(wire.MSG_ODOM_RESULT)
+
+    peer.send(wire.exits(0, [
+        {"id": "far", "x": 8.0, "y": 0.0, "width_m": 1.0, "status": "open"},
+        {"id": "near", "x": 1.0, "y": 0.0, "width_m": 1.0, "status": "open"},
+        {"id": "narrow", "x": 0.5, "y": 0.0, "width_m": 0.2, "status": "open"},
+    ], t_capture_ns=1))
+    reply = peer.recv_of_type(wire.MSG_EXITS_RESULT)
+    assert reply["ok"]
+    assert reply["chosen"] == "near"
+    assert reply["data"]["had_pose"] is True
+    # The narrow one comes back rejected rather than missing.
+    assert any(e["id"] == "narrow" and e["score"] is None for e in reply["ranked"])
+
+
+def test_unusable_exits_are_refused(server):
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"badexit-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send({"type": wire.MSG_EXITS, "seq": 0, "candidates": "not a list"})
+    reply = peer.recv_of_type(wire.MSG_EXITS_RESULT)
+    assert not reply["ok"] and reply["reason"] == wire.REASON_BAD_EXITS
+
+
+def test_the_phase_can_be_changed_and_is_confirmed(server):
+    srv, endpoint = server
+    peer = RawPeer(endpoint, b"phase-peer")
+    peer.send(wire.hello("pytest"))
+    welcome = peer.recv_of_type(wire.MSG_WELCOME)
+    assert welcome["server"]["mission"]["phase"] == wire.PHASE_EXPLORE
+
+    peer.send(wire.phase(wire.PHASE_SEEK, reason="map is good enough",
+                         mission={"target": "the red mug"}))
+    reply = peer.recv_of_type(wire.MSG_PHASE)
+    assert reply["accepted"] is True and reply["phase"] == wire.PHASE_SEEK
+    assert reply["mission"]["target"] == "the red mug"
+
+    session = next(iter(srv.sessions.values()))
+    assert session.phase == wire.PHASE_SEEK
+
+
+def test_an_unknown_phase_is_refused_and_leaves_the_session_alone(server):
+    srv, endpoint = server
+    peer = RawPeer(endpoint, b"badphase-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send({"type": wire.MSG_PHASE, "phase": "t3"})
+    reply = peer.recv_of_type(wire.MSG_PHASE)
+    assert reply["accepted"] is False
+    assert next(iter(srv.sessions.values())).phase == wire.PHASE_EXPLORE
+
+
+def test_the_hello_declares_the_phase_and_mission(server):
+    srv, endpoint = server
+    peer = RawPeer(endpoint, b"hellophase-peer")
+    peer.send(wire.hello("pytest", phase=wire.PHASE_SEEK,
+                         mission={"target": "a green box"}))
+    welcome = peer.recv_of_type(wire.MSG_WELCOME)
+    assert welcome["server"]["mission"]["phase"] == wire.PHASE_SEEK
+    assert welcome["server"]["mission"]["target"] == "a green box"
+    assert next(iter(srv.sessions.values())).phase == wire.PHASE_SEEK
+
+
+def test_a_protocol_1_client_is_still_accepted():
+    """Everything v2 added is additive, so an old client simply gets less.
+
+    Refusing it would break the deployed client for a change that costs it
+    nothing; refusing an unknown version is a different matter, since that one
+    may mean something else by a field name we recognise.
+    """
+    with running_server() as (_, endpoint):
+        peer = RawPeer(endpoint, b"v1-peer")
+        header = wire.hello("pytest")
+        header["protocol"] = 1
+        peer.send(header)
+        assert peer.recv_of_type(wire.MSG_WELCOME)["accepted"] is True
+
+
+def test_a_frame_reports_which_pose_and_map_it_was_processed_against(server):
+    """Their absence from a result is the honest signal, as with scan_seq."""
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"attach-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    payload = jpeg(64, 48)
+    peer.send(wire.frame(seq=0, codec=wire.CODEC_JPEG, width=64, height=48,
+                         t_capture_ns=1), payload)
+    bare = peer.recv_of_type(wire.MSG_RESULT)
+    assert "odom_seq" not in bare and "map_seq" not in bare
+
+    peer.send_odom(7, x=1.0)
+    peer.recv_of_type(wire.MSG_ODOM_RESULT)
+    peer.send_map(3, a_room())
+    peer.recv_of_type(wire.MSG_MAP_RESULT)
+
+    peer.send(wire.frame(seq=1, codec=wire.CODEC_JPEG, width=64, height=48,
+                         t_capture_ns=2), payload)
+    attached = peer.recv_of_type(wire.MSG_RESULT)
+    assert attached["odom_seq"] == 7
+    assert attached["map_seq"] == 3
+    assert attached["map_id"] == "m1"
+
+
+def test_the_server_announces_a_map_update_from_a_processor(server_announcer):
+    """The unsolicited path, end to end, with a processor that always announces.
+
+    Exercised with a stub rather than with deep3r because the wiring under test
+    is the server's — sequence numbers, the enable switches, the map_id check and
+    the ordering against the frame's own result — and none of that involves a
+    model.
+    """
+    _, endpoint = server_announcer
+    peer = RawPeer(endpoint, b"announce-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send_map(0, a_room())
+    peer.recv_of_type(wire.MSG_MAP_RESULT)
+    peer.send(wire.frame(seq=0, codec=wire.CODEC_JPEG, width=64, height=48,
+                         t_capture_ns=1), jpeg(64, 48))
+
+    header, payload = None, b""
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        header, payload = peer.recv_full()
+        if header.get("type") == wire.MSG_MAP_UPDATE:
+            break
+    assert header["type"] == wire.MSG_MAP_UPDATE, "no map_update arrived"
+    assert header["seq"] == 0                      # stamped by the server
+    assert header["map_id"] == "m1"
+    assert header["merge"] == wire.MAP_MERGE_MAX
+    cells = robocam_client.decode_map_patch(header, payload)
+    assert cells.shape == (2, 2)
+    assert (cells == 100).all()
+
+
+def test_an_announcement_for_a_stale_map_id_is_dropped(server_announcer_stale):
+    """A patch for a map the robot has moved on from names coordinates that are gone."""
+    _, endpoint = server_announcer_stale
+    peer = RawPeer(endpoint, b"stale-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send_map(0, a_room())
+    peer.recv_of_type(wire.MSG_MAP_RESULT)
+    peer.send(wire.frame(seq=0, codec=wire.CODEC_JPEG, width=64, height=48,
+                         t_capture_ns=1), jpeg(64, 48))
+
+    # The frame's own result still arrives; the announcement does not.
+    assert peer.recv_of_type(wire.MSG_RESULT)["seq"] == 0
+    with pytest.raises(TimeoutError):
+        peer.recv_of_type(wire.MSG_MAP_UPDATE, timeout_ms=300)
+
+
+def test_map_updates_can_be_switched_off_while_the_comparison_runs(server_announcer_muted):
+    """The way to see what the server WOULD write before letting it."""
+    _, endpoint = server_announcer_muted
+    peer = RawPeer(endpoint, b"muted-peer")
+    peer.send(wire.hello("pytest"))
+    welcome = peer.recv_of_type(wire.MSG_WELCOME)
+    assert welcome["server"]["map"]["send_updates"] is False
+
+    peer.send_map(0, a_room())
+    peer.recv_of_type(wire.MSG_MAP_RESULT)
+    peer.send(wire.frame(seq=0, codec=wire.CODEC_JPEG, width=64, height=48,
+                         t_capture_ns=1), jpeg(64, 48))
+    assert peer.recv_of_type(wire.MSG_RESULT)["seq"] == 0
+    with pytest.raises(TimeoutError):
+        peer.recv_of_type(wire.MSG_MAP_UPDATE, timeout_ms=300)
+
+
+def test_the_real_client_uploads_a_map_and_a_pose(server):
+    """The deployable client file, driving all five streams."""
+    srv, endpoint = server
+    updates = []
+
+    client = robocam_client.RoboCamClient(
+        server=endpoint, client_id="pytest-nav", max_inflight=2,
+        map_every_s=0.2, on_map_update=lambda h, c: updates.append(h),
+    )
+    client.run(
+        robocam_client.SyntheticSource(160, 120, fps=20),
+        duration=2.0, status_every=0,
+        odom_source=robocam_client.SyntheticOdomSource(hz=20.0),
+        map_source=robocam_client.SyntheticMapSource(width=40, height=40, hz=4.0),
+    )
+
+    assert client.odom_results_ok > 0
+    assert client.map_results_ok > 0
+    assert client.maps_sent >= 1
+    assert client._last_map_summary["explored_fraction"] > 0
+    # The pose and the grid agree on their frame, so the server can compare.
+    assert client._last_odom_summary["usable_for_compare"] is True

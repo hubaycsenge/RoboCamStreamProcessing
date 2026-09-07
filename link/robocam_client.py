@@ -8,24 +8,42 @@ OpenCR board.  Single file with no dependency on the ``robocam`` package, so
 deploying it is one ``scp``.
 
     pip3 install pyzmq numpy opencv-python      # opencv usually already on JetPack
-    python3 robocam_client.py --server tcp://10.128.17.196:5555
+    python3 robocam_client.py
+
+The default endpoint is ``tcp://127.0.0.1:5555`` and that is not a placeholder:
+the robot is behind the lab router's NAT (192.168.0.240 or 192.168.1.240,
+depending on which of the two lab routers it joined) and cannot reach any cluster
+address.  ``mecanumbot-deep3r-tunnel.service`` dials *out* to nipg1 and forwards
+the server's port back to the robot's own loopback, so 127.0.0.1:5555 is where
+the server is, from here.  Earlier versions of this file defaulted to
+``10.128.17.196:5555``, which was never reachable from the robot.
 
 Test the link without a camera:
 
-    python3 robocam_client.py --server tcp://10.128.17.196:5555 --source synthetic
+    python3 robocam_client.py --source synthetic
 
 Camera plus both sensors, the normal robot configuration:
 
-    python3 robocam_client.py --server tcp://10.128.17.196:5555 --lidar auto --imu auto
+    python3 robocam_client.py --lidar auto --imu auto
 
-Use as a library:
+Everything, including the map half of the system diagram — the pose and the
+occupancy grid go up, and obstacles the scanner's single plane cannot see come
+back as patches:
 
-    client = RoboCamClient("tcp://10.128.17.196:5555", on_result=my_callback)
-    client.run(OpenCVSource("0"), scan_source=..., imu_source=...)
+    python3 robocam_client.py --lidar auto --imu auto --odom auto --map auto
+
+Use as a library, which is how the obstacles actually reach a costmap: this file
+decodes a ``map_update`` and hands it over, and the node that owns the robot's
+map merges it with :func:`merge_map_patch`.
+
+    client = RoboCamClient("tcp://127.0.0.1:5555", on_result=my_callback,
+                           on_map_update=my_merge, on_found=my_behaviour_tree)
+    client.run(OpenCVSource("0"), scan_source=..., imu_source=...,
+               odom_source=..., map_source=...)
 
 Each sensor is read independently, on its own thread, because they run at
-different rates (~30 Hz, ~5 Hz and ~100 Hz) and none of them should ever wait for
-another.  How the reader hands data to the main loop differs by what the data
+different rates (~30 Hz, ~5 Hz, ~100 Hz, ~20 Hz and once every few seconds) and
+none of them should ever wait for another.  How the reader hands data to the main loop differs by what the data
 *is*: the scanner keeps one latest-wins slot, since an old revolution is worthless
 once a new one exists, while the IMU keeps a short queue and ships every sample,
 since the value of inertial data is in the sequence rather than in the newest
@@ -49,6 +67,7 @@ import struct
 import sys
 import threading
 import time
+import zlib
 from collections import deque
 from typing import Any, Callable, Deque, Dict, Iterator, List, Optional, Tuple
 
@@ -57,7 +76,7 @@ import zmq
 
 log = logging.getLogger("robocam.client")
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 MSG_HELLO = "hello"
 MSG_WELCOME = "welcome"
@@ -67,6 +86,20 @@ MSG_SCAN = "scan"
 MSG_SCAN_RESULT = "scan_result"
 MSG_IMU = "imu"
 MSG_IMU_RESULT = "imu_result"
+MSG_ODOM = "odom"
+MSG_ODOM_RESULT = "odom_result"
+MSG_MAP = "map"
+MSG_MAP_RESULT = "map_result"
+MSG_EXITS = "exits"
+MSG_EXITS_RESULT = "exits_result"
+# The three the server sends unasked: the patch Compare wants merged into the
+# robot's map, the correction it offers SLAM, and the T2 announcement that the
+# target has been located.  Nothing on the robot requests these, so the receive
+# path must not be written as "a reply to something I sent".
+MSG_MAP_UPDATE = "map_update"
+MSG_POSE_HINT = "pose_hint"
+MSG_FOUND = "found"
+MSG_PHASE = "phase"
 MSG_PING = "ping"
 MSG_PONG = "pong"
 MSG_BYE = "bye"
@@ -78,6 +111,20 @@ CODEC_RAW_BGR = "raw_bgr"
 SCAN_ENC_U16_MM = "u16mm"
 
 IMU_ENC_F32 = "f32"
+
+MAP_ENC_I8 = "i8"
+MAP_ENC_I8_ZLIB = "i8z"
+
+#: nav_msgs/OccupancyGrid's own sentinel for "never observed".  Named, because a
+#: bare -1 in a threshold comparison is how unknown space quietly becomes free
+#: space and the robot drives into a room it has never seen.
+MAP_UNKNOWN = -1
+
+MAP_MERGE_MAX = "max"
+MAP_MERGE_REPLACE = "replace"
+
+PHASE_EXPLORE = "t1"
+PHASE_SEEK = "t2"
 
 #: Everything the OpenCR reports, in the order the protocol names the channels:
 #: angular rate, specific force, magnetic field, orientation quaternion.
@@ -1827,6 +1874,627 @@ class ImuFeed:
 
 
 # ---------------------------------------------------------------------------
+# Odometry
+# ---------------------------------------------------------------------------
+#
+# The pose is the smallest thing on this link and the one with the most leverage:
+# it is what lets the server put a reconstruction where the robot's map is.  A
+# cloud without a pose is a cloud in the model's own arbitrary world frame, which
+# nothing on the robot can merge with anything.
+#
+# The frame matters more than the numbers.  ``/odom`` is dead reckoning: smooth,
+# continuous and wrong by however much the wheels have slipped.  The map frame is
+# that plus SLAM's accumulated correction, and it is the frame the occupancy grid
+# is drawn in.  Sending the first while uploading a grid in the second produces a
+# comparison that finds differences everywhere and calls them furniture, so the
+# frame travels with every pose and the server checks it.
+
+
+class OdomUnavailable(RuntimeError):
+    """Raised when the requested odometry source cannot be opened."""
+
+
+class OdomReading:
+    """One pose, in whatever frame the source reports."""
+
+    __slots__ = ("x", "y", "z", "yaw", "quaternion", "vx", "vy", "vyaw",
+                 "frame", "child_frame", "t_capture_ns")
+
+    def __init__(self, x: float, y: float, yaw: float, z: float = 0.0,
+                 quaternion: Optional[Tuple[float, float, float, float]] = None,
+                 vx: float = 0.0, vy: float = 0.0, vyaw: float = 0.0,
+                 frame: str = "map", child_frame: str = "base_link",
+                 t_capture_ns: int = 0) -> None:
+        self.x = float(x)
+        self.y = float(y)
+        self.z = float(z)
+        self.yaw = float(yaw)
+        self.quaternion = quaternion
+        self.vx = float(vx)
+        self.vy = float(vy)
+        self.vyaw = float(vyaw)
+        self.frame = frame
+        self.child_frame = child_frame
+        self.t_capture_ns = t_capture_ns or time.monotonic_ns()
+
+
+class OdomSource:
+    """Interface for anything producing poses."""
+
+    def info(self) -> Dict[str, Any]:
+        return {}
+
+    def poses(self) -> Iterator[OdomReading]:
+        raise NotImplementedError
+
+    def request_stop(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class SyntheticOdomSource(OdomSource):
+    """A robot driving a slow circle.  For testing the link without a robot.
+
+    A circle rather than a straight line on purpose: a pose stream that never
+    changes heading cannot distinguish a correct yaw convention from one that is
+    negated, and that mistake is invisible until a reconstruction lands mirrored.
+    """
+
+    def __init__(self, hz: float = 20.0, radius_m: float = 2.0,
+                 period_s: float = 40.0, frame: str = "map") -> None:
+        self.hz = max(1.0, float(hz))
+        self.radius_m = float(radius_m)
+        self.period_s = max(1.0, float(period_s))
+        self.frame = frame
+        self._stop = False
+
+    def info(self) -> Dict[str, Any]:
+        return {"model": "synthetic", "rate_hz": self.hz, "frame": self.frame,
+                "radius_m": self.radius_m}
+
+    def request_stop(self) -> None:
+        self._stop = True
+
+    def poses(self) -> Iterator[OdomReading]:
+        t0 = time.monotonic()
+        period = 1.0 / self.hz
+        while not self._stop:
+            t = time.monotonic() - t0
+            angle = TWO_PI * (t / self.period_s)
+            yaw = angle + math.pi / 2.0
+            yield OdomReading(
+                x=self.radius_m * math.cos(angle),
+                y=self.radius_m * math.sin(angle),
+                yaw=math.atan2(math.sin(yaw), math.cos(yaw)),
+                quaternion=_euler_to_quat(0.0, 0.0, yaw),
+                vx=TWO_PI * self.radius_m / self.period_s,
+                vyaw=TWO_PI / self.period_s,
+                frame=self.frame,
+            )
+            time.sleep(period)
+
+
+class Ros2OdomSource(OdomSource):
+    """Subscribe to a ROS 2 pose topic.
+
+    Accepts ``nav_msgs/Odometry``, ``geometry_msgs/PoseWithCovarianceStamped``
+    (what AMCL and most SLAM localisers publish) and ``geometry_msgs/PoseStamped``.
+    Three types rather than one because which of them carries the *map*-frame
+    pose differs by stack: on this robot ``/odom`` is dead reckoning and the map
+    pose comes from the localiser, and it is the second that this link wants.
+
+    The frame is taken from the message's own header rather than from a flag,
+    and a mismatch with ``expect_frame`` is warned about once — loudly, because
+    the resulting failure is a comparison that runs and is wrong rather than one
+    that stops.
+    """
+
+    def __init__(self, topic: str = "/amcl_pose", timeout_s: float = 5.0,
+                 require_publisher: bool = False, expect_frame: str = "map",
+                 queue_size: int = 10) -> None:
+        try:
+            import rclpy  # noqa: PLC0415
+            from rclpy.node import Node  # noqa: PLC0415
+        except ImportError as exc:
+            raise OdomUnavailable(f"rclpy not importable: {exc}") from exc
+
+        self.topic = topic
+        self.expect_frame = expect_frame
+        self._rclpy = rclpy
+        self._latest: Optional[OdomReading] = None
+        self._lock = threading.Lock()
+        self._stop = False
+        self._frame_warned = False
+        self._msg_type = ""
+
+        if not rclpy.ok():
+            rclpy.init(args=None)
+        self._node = Node("robocam_odom_client")
+
+        self._subs = []
+        for module, name in (("nav_msgs.msg", "Odometry"),
+                             ("geometry_msgs.msg", "PoseWithCovarianceStamped"),
+                             ("geometry_msgs.msg", "PoseStamped")):
+            try:
+                mod = __import__(module, fromlist=[name])
+            except ImportError:
+                continue
+            msg_type = getattr(mod, name, None)
+            if msg_type is None:
+                continue
+            # Subscribing with every plausible type and letting the one that
+            # matches deliver: a mismatched subscription is silent in ROS 2, so
+            # guessing wrong would look exactly like a topic nobody publishes.
+            self._subs.append(self._node.create_subscription(
+                msg_type, topic, self._on_msg, queue_size))
+
+        if not self._subs:
+            raise OdomUnavailable(
+                "none of nav_msgs/Odometry, PoseWithCovarianceStamped or "
+                "PoseStamped could be imported"
+            )
+
+        if require_publisher and self._await_publisher(timeout_s) == 0:
+            self.close()
+            raise OdomUnavailable(
+                f"no publisher on {topic} after {timeout_s:.0f}s. "
+                f"{self._diagnose(timeout_s)}"
+            )
+
+        self._spin = threading.Thread(target=self._spin_loop, name="odom-spin", daemon=True)
+        self._spin.start()
+
+    def _await_publisher(self, deadline_s: float) -> int:
+        deadline = time.monotonic() + deadline_s
+        while time.monotonic() < deadline:
+            n = self._node.count_publishers(self.topic)
+            if n:
+                return n
+            time.sleep(0.2)
+        return self._node.count_publishers(self.topic)
+
+    def _diagnose(self, waited_s: float) -> str:
+        return (f"Nothing published on {self.topic} in {waited_s:.0f}s. Check "
+                "ROS_DOMAIN_ID matches the robot's (19) and that the localiser "
+                "is running; `ros2 topic list` on the robot is the quickest test. "
+                "Note /odom is dead reckoning -- the map-frame pose is what this "
+                "link wants, and it usually comes from the localiser instead.")
+
+    def info(self) -> Dict[str, Any]:
+        return {"model": "ros2", "topic": self.topic, "message": self._msg_type,
+                "expect_frame": self.expect_frame}
+
+    def request_stop(self) -> None:
+        self._stop = True
+
+    def _on_msg(self, msg) -> None:
+        header = getattr(msg, "header", None)
+        frame = getattr(header, "frame_id", "") if header is not None else ""
+        pose = msg.pose
+        twist = getattr(msg, "twist", None)
+        # nav_msgs/Odometry and PoseWithCovarianceStamped both nest the pose one
+        # level deeper than PoseStamped does.
+        if hasattr(pose, "pose"):
+            covariance_holder, pose = pose, pose.pose
+            del covariance_holder
+        if twist is not None and hasattr(twist, "twist"):
+            twist = twist.twist
+
+        q = pose.orientation
+        reading = OdomReading(
+            x=pose.position.x, y=pose.position.y, z=pose.position.z,
+            yaw=_yaw_from_quat(q.w, q.x, q.y, q.z),
+            quaternion=(q.w, q.x, q.y, q.z),
+            vx=getattr(getattr(twist, "linear", None), "x", 0.0) or 0.0,
+            vy=getattr(getattr(twist, "linear", None), "y", 0.0) or 0.0,
+            vyaw=getattr(getattr(twist, "angular", None), "z", 0.0) or 0.0,
+            frame=frame or self.expect_frame,
+            child_frame=getattr(msg, "child_frame_id", "") or "base_link",
+        )
+        self._msg_type = type(msg).__name__
+        if (self.expect_frame and reading.frame != self.expect_frame
+                and not self._frame_warned):
+            self._frame_warned = True
+            log.warning(
+                "%s publishes poses in frame %r, not %r. The server compares the "
+                "reconstruction against the grid you upload, and a pose in the "
+                "wrong frame makes that comparison confidently wrong rather than "
+                "obviously broken -- it will refuse it instead.",
+                self.topic, reading.frame, self.expect_frame,
+            )
+        with self._lock:
+            self._latest = reading
+
+    def _spin_loop(self) -> None:
+        while not self._stop and self._rclpy.ok():
+            try:
+                self._rclpy.spin_once(self._node, timeout_sec=0.1)
+            except Exception:  # pragma: no cover - shutdown races
+                break
+
+    def poses(self) -> Iterator[OdomReading]:
+        last = None
+        while not self._stop:
+            with self._lock:
+                reading = self._latest
+            if reading is not None and reading is not last:
+                last = reading
+                yield reading
+            else:
+                time.sleep(0.01)
+
+    def close(self) -> None:
+        self._stop = True
+        try:
+            self._node.destroy_node()
+        except Exception:  # pragma: no cover
+            pass
+
+
+def _yaw_from_quat(qw: float, qx: float, qy: float, qz: float) -> float:
+    """Yaw about +z from a ROS-ordered quaternion.  The inverse of _euler_to_quat."""
+    return math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+
+
+class OdomFeed:
+    """Reads a pose source on its own thread, keeping only the newest pose.
+
+    Latest-wins, like the scanner and unlike the IMU: the value of a pose is
+    entirely in it being current.  An old one describes where the robot was, and
+    the robot is not there.
+    """
+
+    def __init__(self, source: OdomSource) -> None:
+        self.source = source
+        self._latest: Optional[OdomReading] = None
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop = False
+        self.read = 0
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="odom", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            for reading in self.source.poses():
+                if self._stop:
+                    break
+                with self._lock:
+                    self._latest = reading
+                    self.read += 1
+        except Exception:
+            log.exception("odom reader stopped")
+
+    def take(self) -> Optional[OdomReading]:
+        with self._lock:
+            reading, self._latest = self._latest, None
+            return reading
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop = True
+        self.source.request_stop()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+        self.source.close()
+
+
+# ---------------------------------------------------------------------------
+# The occupancy grid
+# ---------------------------------------------------------------------------
+#
+# The one stream on this link that goes up so that something can come back down
+# it.  The server needs the robot's map to have anything to compare its
+# reconstruction against, and what it returns -- cells the camera saw and the
+# scanner's single plane could not -- goes into the same grid.
+#
+# It is also the largest message here and the least perishable.  A 400x400 grid
+# at 5 cm is 160 kB raw and a few kB through zlib, and a room does not change in
+# the seconds between uploads, so this is sent on a timer rather than per frame.
+
+
+class MapUnavailable(RuntimeError):
+    """Raised when the requested map source cannot be opened."""
+
+
+class MapReading:
+    """One occupancy grid, in nav_msgs/OccupancyGrid's layout exactly."""
+
+    __slots__ = ("cells", "resolution", "origin", "frame", "map_id", "t_capture_ns")
+
+    def __init__(self, cells: np.ndarray, resolution: float,
+                 origin: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+                 frame: str = "map", map_id: str = "", t_capture_ns: int = 0) -> None:
+        self.cells = np.ascontiguousarray(cells, dtype=np.int8)
+        self.resolution = float(resolution)
+        self.origin = tuple(float(v) for v in origin)
+        self.frame = frame
+        self.map_id = map_id
+        self.t_capture_ns = t_capture_ns or time.monotonic_ns()
+
+    @property
+    def width(self) -> int:
+        return int(self.cells.shape[1])
+
+    @property
+    def height(self) -> int:
+        return int(self.cells.shape[0])
+
+
+class MapSource:
+    """Interface for anything producing occupancy grids."""
+
+    def info(self) -> Dict[str, Any]:
+        return {}
+
+    def maps(self) -> Iterator[MapReading]:
+        raise NotImplementedError
+
+    def request_stop(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class SyntheticMapSource(MapSource):
+    """A rectangular room with a doorway.  For testing the link without SLAM."""
+
+    def __init__(self, width: int = 200, height: int = 200, resolution: float = 0.05,
+                 hz: float = 0.5, frame: str = "map") -> None:
+        self.width = int(width)
+        self.height = int(height)
+        self.resolution = float(resolution)
+        self.hz = max(0.05, float(hz))
+        self.frame = frame
+        self._stop = False
+
+    def info(self) -> Dict[str, Any]:
+        return {"model": "synthetic", "width": self.width, "height": self.height,
+                "resolution": self.resolution, "frame": self.frame}
+
+    def request_stop(self) -> None:
+        self._stop = True
+
+    def _room(self) -> np.ndarray:
+        cells = np.zeros((self.height, self.width), dtype=np.int8)
+        cells[0, :] = 100
+        cells[-1, :] = 100
+        cells[:, 0] = 100
+        cells[:, -1] = 100
+        # A doorway, so the grid has a frontier worth calling an exit.
+        cells[self.height // 2 - 8: self.height // 2 + 8, -1] = MAP_UNKNOWN
+        return cells
+
+    def maps(self) -> Iterator[MapReading]:
+        period = 1.0 / self.hz
+        cells = self._room()
+        origin = (-0.5 * self.width * self.resolution,
+                  -0.5 * self.height * self.resolution, 0.0)
+        while not self._stop:
+            yield MapReading(cells, self.resolution, origin,
+                             frame=self.frame, map_id="synthetic-1")
+            time.sleep(period)
+
+
+class Ros2MapSource(MapSource):
+    """Subscribe to a ROS 2 ``nav_msgs/OccupancyGrid`` topic.
+
+    The QoS is the part that is easy to get wrong and hard to debug: ``/map`` is
+    published **transient local** (latched), so a subscriber with the default
+    volatile QoS silently receives nothing at all until the map is republished —
+    which slam_toolbox does on its own schedule and a static map server never
+    does.  A transient-local subscriber gets the last map on connection, which is
+    what makes this work the first time rather than after a minute.
+    """
+
+    def __init__(self, topic: str = "/map", timeout_s: float = 10.0,
+                 require_publisher: bool = False, map_id: str = "") -> None:
+        try:
+            import rclpy  # noqa: PLC0415
+            from rclpy.node import Node  # noqa: PLC0415
+            from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy,  # noqa: PLC0415
+                                   QoSProfile, QoSReliabilityPolicy)
+            from nav_msgs.msg import OccupancyGrid  # noqa: PLC0415
+        except ImportError as exc:
+            raise MapUnavailable(f"rclpy / nav_msgs not importable: {exc}") from exc
+
+        self.topic = topic
+        self.map_id = map_id
+        self._rclpy = rclpy
+        self._latest: Optional[MapReading] = None
+        self._lock = threading.Lock()
+        self._stop = False
+        self._seen = 0
+
+        if not rclpy.ok():
+            rclpy.init(args=None)
+        self._node = Node("robocam_map_client")
+        qos = QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._sub = self._node.create_subscription(OccupancyGrid, topic, self._on_msg, qos)
+
+        if require_publisher and self._await_publisher(timeout_s) == 0:
+            self.close()
+            raise MapUnavailable(
+                f"no publisher on {topic} after {timeout_s:.0f}s. Is SLAM running? "
+                "`ros2 topic info /map --verbose` on the robot shows the publisher "
+                "and its QoS; this subscriber is transient-local, which is what a "
+                "latched map needs."
+            )
+
+        self._spin = threading.Thread(target=self._spin_loop, name="map-spin", daemon=True)
+        self._spin.start()
+
+    def _await_publisher(self, deadline_s: float) -> int:
+        deadline = time.monotonic() + deadline_s
+        while time.monotonic() < deadline:
+            n = self._node.count_publishers(self.topic)
+            if n:
+                return n
+            time.sleep(0.2)
+        return self._node.count_publishers(self.topic)
+
+    def info(self) -> Dict[str, Any]:
+        return {"model": "ros2", "topic": self.topic, "maps_seen": self._seen}
+
+    def request_stop(self) -> None:
+        self._stop = True
+
+    def _on_msg(self, msg) -> None:
+        info = msg.info
+        cells = np.asarray(msg.data, dtype=np.int8).reshape(info.height, info.width)
+        q = info.origin.orientation
+        reading = MapReading(
+            cells=cells,
+            resolution=info.resolution,
+            origin=(info.origin.position.x, info.origin.position.y,
+                    _yaw_from_quat(q.w, q.x, q.y, q.z)),
+            frame=getattr(msg.header, "frame_id", "map") or "map",
+            # A map_id the server can test for equality.  Derived from the
+            # geometry rather than invented per message, so that a republished
+            # identical map keeps its identity and a SLAM restart -- which moves
+            # the origin -- gets a new one, which is exactly when a patch for the
+            # old map must stop being applied.
+            map_id=self.map_id or "slam-%.3f-%.3f-%d-%d" % (
+                info.origin.position.x, info.origin.position.y,
+                info.width, info.height),
+        )
+        self._seen += 1
+        with self._lock:
+            self._latest = reading
+
+    def _spin_loop(self) -> None:
+        while not self._stop and self._rclpy.ok():
+            try:
+                self._rclpy.spin_once(self._node, timeout_sec=0.2)
+            except Exception:  # pragma: no cover
+                break
+
+    def maps(self) -> Iterator[MapReading]:
+        last = None
+        while not self._stop:
+            with self._lock:
+                reading = self._latest
+            if reading is not None and reading is not last:
+                last = reading
+                yield reading
+            else:
+                time.sleep(0.05)
+
+    def close(self) -> None:
+        self._stop = True
+        try:
+            self._node.destroy_node()
+        except Exception:  # pragma: no cover
+            pass
+
+
+class MapFeed:
+    """Reads a map source on its own thread, keeping only the newest grid."""
+
+    def __init__(self, source: MapSource) -> None:
+        self.source = source
+        self._latest: Optional[MapReading] = None
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop = False
+        self.read = 0
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="map", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            for reading in self.source.maps():
+                if self._stop:
+                    break
+                with self._lock:
+                    self._latest = reading
+                    self.read += 1
+        except Exception:
+            log.exception("map reader stopped")
+
+    def take(self) -> Optional[MapReading]:
+        with self._lock:
+            reading, self._latest = self._latest, None
+            return reading
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop = True
+        self.source.request_stop()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+        self.source.close()
+
+
+def decode_map_patch(header: Dict[str, Any], payload: bytes) -> np.ndarray:
+    """Unpack the cells of a ``map_update`` into an int8 (height, width) array.
+
+    Handed to the ``on_map_update`` callback alongside the header, so that
+    whatever owns the robot's costmap merges it rather than this client doing so
+    behind that owner's back.  Merging is not this file's business: it does not
+    know whether the robot's map lives in a ROS node, a Nav2 costmap layer or a
+    file, and a client that guessed would be writing to a map it does not own.
+
+    :func:`merge_map_patch` is here for the caller that does own one.
+    """
+    width = int(header["width"])
+    height = int(header["height"])
+    encoding = str(header.get("encoding", MAP_ENC_I8))
+    raw = zlib.decompress(payload) if encoding == MAP_ENC_I8_ZLIB else payload
+    if len(raw) != width * height:
+        raise ValueError(
+            f"map_update payload is {len(raw)} bytes for a {width}x{height} patch"
+        )
+    return np.frombuffer(raw, dtype=np.int8).reshape(height, width)
+
+
+def merge_map_patch(grid: np.ndarray, patch: np.ndarray, x0: int, y0: int,
+                    merge: str = MAP_MERGE_MAX) -> int:
+    """Apply a patch to a grid in place; return the number of cells changed.
+
+    The merge rule is the server's and it is asymmetric on purpose: under
+    ``max`` a patch may raise a cell's occupancy and may fill in an unknown one,
+    but may never lower an observed cell or return one to unknown.
+
+    That is what makes the server safe to be wrong.  Its evidence is a monocular
+    reconstruction, which when it errs invents a surface — and an invented
+    obstacle costs a detour.  The opposite policy would let a *missing* surface
+    clear a wall the robot's own scanner saw, and that costs a collision.
+    """
+    ph, pw = patch.shape
+    sx0, sy0 = max(0, -x0), max(0, -y0)
+    dx0, dy0 = max(0, x0), max(0, y0)
+    dx1, dy1 = min(grid.shape[1], x0 + pw), min(grid.shape[0], y0 + ph)
+    if dx1 <= dx0 or dy1 <= dy0:
+        return 0
+
+    target = grid[dy0:dy1, dx0:dx1]
+    source = patch[sy0:sy0 + (dy1 - dy0), sx0:sx0 + (dx1 - dx0)]
+    if merge == MAP_MERGE_REPLACE:
+        changed = int(np.count_nonzero(target != source))
+        target[:] = source
+        return changed
+    # Unknown in the source means "no opinion" and is masked out rather than
+    # left to lose a numeric maximum by accident -- which it would, since -1 < 0,
+    # right up until unknown is spelled some other way.
+    has_opinion = source >= 0
+    merged = np.where(has_opinion & (source > target), source, target)
+    changed = int(np.count_nonzero(merged != target))
+    target[:] = merged
+    return changed
+
+
+# ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
 
@@ -1853,6 +2521,16 @@ class RoboCamClient:
         on_scan_result: Optional[Callable[[Dict[str, Any]], None]] = None,
         max_inflight_imu: int = 2,
         on_imu_result: Optional[Callable[[Dict[str, Any]], None]] = None,
+        max_inflight_odom: int = 2,
+        on_odom_result: Optional[Callable[[Dict[str, Any]], None]] = None,
+        map_every_s: float = 5.0,
+        on_map_result: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_map_update: Optional[Callable[[Dict[str, Any], np.ndarray], None]] = None,
+        on_pose_hint: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_found: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_exits_result: Optional[Callable[[Dict[str, Any]], None]] = None,
+        phase: str = PHASE_EXPLORE,
+        mission: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.server = server
         self.client_id = client_id
@@ -1870,20 +2548,53 @@ class RoboCamClient:
         # cheapest thing on this link and the last thing worth starving.
         self.max_inflight_imu = max(1, max_inflight_imu)
         self.on_imu_result = on_imu_result
+        # A fourth window for the pose.  It is the smallest message here and the
+        # one that decides where everything else lands, so it is the last thing
+        # that should be starved by a backlog of images.
+        self.max_inflight_odom = max(1, max_inflight_odom)
+        self.on_odom_result = on_odom_result
+        # The map is not windowed but timed: it is large, it is not perishable,
+        # and one in flight at a time is plenty.  Uploading it per frame would
+        # spend more of the uplink on a room that is not changing than on the
+        # images of it that are.
+        self.map_every_s = float(map_every_s)
+        self.on_map_result = on_map_result
+        # The three the server sends unasked.  A robot with none of these
+        # callbacks still runs -- it simply ignores what the server found, which
+        # is the honest behaviour for a client that has nowhere to put it.
+        self.on_map_update = on_map_update
+        self.on_pose_hint = on_pose_hint
+        self.on_found = on_found
+        self.on_exits_result = on_exits_result
+        self.phase = phase
+        self.mission = dict(mission or {})
 
         self.ctx = zmq.Context.instance()
         self.sock: Optional[zmq.Socket] = None
         self._pending: Dict[int, float] = {}   # seq -> monotonic send time
         self._pending_scans: Dict[int, float] = {}
         self._pending_imu: Dict[int, float] = {}
+        self._pending_odom: Dict[int, float] = {}
+        self._pending_maps: Dict[int, float] = {}
         self._seq = 0
         self._scan_seq = 0
         self._imu_seq = 0
+        self._odom_seq = 0
+        self._map_seq = 0
+        self._exits_seq = 0
         self._stop = False
         self._connected = False
         self._last_rx = time.monotonic()
         self._lidar_info: Dict[str, Any] = {}
         self._imu_info: Dict[str, Any] = {}
+        self._odom_info: Dict[str, Any] = {}
+        self._map_info: Dict[str, Any] = {}
+        # The last grid uploaded, kept so that a full re-send after a reconnect
+        # does not have to wait for SLAM to publish again -- the server drops
+        # every session's map with the session, and a robot that only re-sent on
+        # the next publish would be uncomparable for as long as that took.
+        self._last_map: Optional[MapReading] = None
+        self._last_map_sent = 0.0
         # Overwritten from the source in run(); the defaults describe an OpenCR
         # so that a caller feeding bursts in by hand does not have to say so.
         self._imu_fields: Tuple[str, ...] = IMU_FIELDS
@@ -1893,6 +2604,12 @@ class RoboCamClient:
         # scan with an error, so there is no point sending them.
         self._server_wants_scans = True
         self._server_wants_imu = True
+        self._server_wants_odom = True
+        self._server_wants_map = True
+        # Whether the server will send anything back for a map.  A server that
+        # accepts grids but has compare disabled is one there is little point
+        # uploading to, and saying so beats spending the uplink to find out.
+        self._server_sends_updates = False
 
         # Counters for the periodic status line.
         self.sent = 0
@@ -1908,10 +2625,21 @@ class RoboCamClient:
         self.imu_results_ok = 0
         self.imu_results_bad = 0
         self.imu_dropped = 0
+        self.odom_sent = 0
+        self.odom_results_ok = 0
+        self.odom_results_bad = 0
+        self.maps_sent = 0
+        self.map_results_ok = 0
+        self.map_results_bad = 0
+        self.map_updates_received = 0
+        self.pose_hints_received = 0
+        self.founds_received = 0
         self._rtt_sum = 0.0
         self._rtt_n = 0
         self._last_scan_summary: Dict[str, Any] = {}
         self._last_imu_summary: Dict[str, Any] = {}
+        self._last_odom_summary: Dict[str, Any] = {}
+        self._last_map_summary: Dict[str, Any] = {}
 
     # -- connection -------------------------------------------------------
 
@@ -1941,8 +2669,16 @@ class RoboCamClient:
             "camera": getattr(self, "_src_name", ""),
             "lidar": self._lidar_info,
             "imu": self._imu_info,
+            "odom": self._odom_info,
+            "map": self._map_info,
+            "phase": self.phase,
+            "mission": self.mission,
             "t_send_ns": time.monotonic_ns(),
         })
+        # The server drops everything it knew about this session when the socket
+        # went away, the map included.  Re-uploading is the client's job because
+        # only the client still has it.
+        self._last_map_sent = 0.0
 
     def close_socket(self) -> None:
         if self.sock is not None:
@@ -1965,7 +2701,9 @@ class RoboCamClient:
 
     def run(self, source: FrameSource, duration: float = 0.0, status_every: float = 5.0,
             scan_source: Optional[ScanSource] = None,
-            imu_source: Optional[ImuSource] = None) -> None:
+            imu_source: Optional[ImuSource] = None,
+            odom_source: Optional[OdomSource] = None,
+            map_source: Optional[MapSource] = None) -> None:
         import cv2
 
         self._src_width = source.width
@@ -1990,6 +2728,20 @@ class RoboCamClient:
             imu_feed.start()
             log.info("imu: %s", ", ".join(f"{k}={v}" for k, v in self._imu_info.items()))
 
+        odom_feed: Optional[OdomFeed] = None
+        if odom_source is not None:
+            self._odom_info = odom_source.info()
+            odom_feed = OdomFeed(odom_source)
+            odom_feed.start()
+            log.info("odom: %s", ", ".join(f"{k}={v}" for k, v in self._odom_info.items()))
+
+        map_feed: Optional[MapFeed] = None
+        if map_source is not None:
+            self._map_info = map_source.info()
+            map_feed = MapFeed(map_source)
+            map_feed.start()
+            log.info("map: %s", ", ".join(f"{k}={v}" for k, v in self._map_info.items()))
+
         self.connect()
         t_start = time.monotonic()
         t_status = t_start
@@ -2013,6 +2765,13 @@ class RoboCamClient:
                     self._pump_lidar(feed)
                 if imu_feed is not None:
                     self._pump_imu(imu_feed)
+                # The pose goes before the frame for the same reason the other
+                # two do, and more so: it is what the server will use to decide
+                # where this frame's reconstruction belongs on the map.
+                if odom_feed is not None:
+                    self._pump_odom(odom_feed)
+                if map_feed is not None:
+                    self._pump_map(map_feed, now)
 
                 if len(self._pending) >= self.max_inflight:
                     # Server is behind. Drop this frame at the source.
@@ -2036,6 +2795,10 @@ class RoboCamClient:
                 feed.stop()
             if imu_feed is not None:
                 imu_feed.stop()
+            if odom_feed is not None:
+                odom_feed.stop()
+            if map_feed is not None:
+                map_feed.stop()
             source.close()
             self.close_socket()
 
@@ -2130,6 +2893,160 @@ class RoboCamClient:
             self.imu_samples_sent += len(samples)
         self.imu_dropped += dropped
 
+    def _pump_odom(self, feed: OdomFeed) -> None:
+        """Send the newest pose, if there is one and the server wants it."""
+        reading = feed.take()
+        if reading is None or not self._server_wants_odom:
+            return
+        if len(self._pending_odom) >= self.max_inflight_odom:
+            # Dropped rather than queued: a pose that waited is a pose about
+            # somewhere the robot no longer is, and the next one is along in
+            # 50 ms anyway.
+            return
+        self._send_odom(reading)
+
+    def _send_odom(self, reading: OdomReading) -> None:
+        seq = self._odom_seq
+        self._odom_seq += 1
+        header = {
+            "type": MSG_ODOM,
+            "seq": seq,
+            "frame": reading.frame,
+            "child_frame": reading.child_frame,
+            "x": reading.x,
+            "y": reading.y,
+            "z": reading.z,
+            "yaw": reading.yaw,
+            "vx": reading.vx,
+            "vy": reading.vy,
+            "vyaw": reading.vyaw,
+            "source": self._odom_info.get("model", ""),
+            "t_capture_ns": int(reading.t_capture_ns),
+            "t_send_ns": time.monotonic_ns(),
+        }
+        if reading.quaternion is not None:
+            qw, qx, qy, qz = reading.quaternion
+            header.update({"qw": qw, "qx": qx, "qy": qy, "qz": qz})
+        if self._send(header):
+            self._pending_odom[seq] = time.monotonic()
+            self.odom_sent += 1
+
+    def _pump_map(self, feed: MapFeed, now: float) -> None:
+        """Upload the grid, at most every ``map_every_s``.
+
+        Timed rather than event-driven because slam_toolbox republishes the whole
+        map on its own schedule whether anything changed or not, and a robot that
+        forwarded every one would spend a large share of a shared uplink
+        re-sending a room that is standing still.
+
+        A grid the feed has not replaced is still re-sent when the timer comes
+        round, because the *server* may have lost it: sessions are dropped on
+        timeout and on reconnect, and the server's copy goes with them.
+        """
+        if not self._server_wants_map:
+            return
+        reading = feed.take()
+        if reading is not None:
+            self._last_map = reading
+        if self._last_map is None:
+            return
+        if self._last_map_sent and now - self._last_map_sent < self.map_every_s:
+            return
+        if self._pending_maps:
+            # One grid in flight at a time.  Two would be two copies of the same
+            # room competing to be the one the server compares against.
+            return
+        self._send_map(self._last_map)
+        self._last_map_sent = now
+
+    def _send_map(self, reading: MapReading) -> None:
+        raw = np.ascontiguousarray(reading.cells, dtype=np.int8).tobytes()
+        # Level 6, not 9: a mostly-unknown grid compresses to within a few
+        # percent either way, and 9 costs several times the CPU on a Jetson that
+        # has a camera to encode.
+        payload = zlib.compress(raw, 6)
+
+        seq = self._map_seq
+        self._map_seq += 1
+        header = {
+            "type": MSG_MAP,
+            "seq": seq,
+            "encoding": MAP_ENC_I8_ZLIB,
+            "width": reading.width,
+            "height": reading.height,
+            "resolution": reading.resolution,
+            "origin": list(reading.origin),
+            "frame": reading.frame,
+            "map_id": reading.map_id,
+            # The robot's own costmap thresholds travel with the grid: a server
+            # that assumed ROS's 65/25 while this robot ran at something else
+            # would disagree about which cells are obstacles, and the
+            # disagreement would show up only as a comparison finding
+            # differences along every wall.
+            "occupied_min": 65,
+            "free_max": 25,
+            "unknown": MAP_UNKNOWN,
+            "full": True,
+            "x0": 0,
+            "y0": 0,
+            "source": self._map_info.get("model", ""),
+            "t_capture_ns": int(reading.t_capture_ns),
+            "t_send_ns": time.monotonic_ns(),
+        }
+        if self._send(header, payload):
+            self._pending_maps[seq] = time.monotonic()
+            self.maps_sent += 1
+            log.info("map: uploaded %dx%d @%.3f m/cell, %.1f kB compressed (%.0f%% of raw)",
+                     reading.width, reading.height, reading.resolution,
+                     len(payload) / 1000.0, 100.0 * len(payload) / max(1, len(raw)))
+
+    def send_exits(self, candidates: List[Dict[str, Any]], map_id: str = "",
+                   frame: str = "map", source: str = "frontier") -> bool:
+        """Send the robot's exit candidates and get them ranked.
+
+        Public API rather than a source with a thread, because exits are not a
+        sensor: they come from whatever on the robot is doing frontier detection,
+        and — crucially — from what that node *remembers* about which ones it has
+        already driven to.  The server ranks; only the robot knows what has been
+        tried.
+
+        Each candidate is ``{"id", "x", "y", "yaw", "width_m", "score",
+        "status"}``; ``status`` is one of ``open``, ``visited``, ``blocked``.
+        The ranking arrives at ``on_exits_result``.
+        """
+        seq = self._exits_seq
+        self._exits_seq += 1
+        return self._send({
+            "type": MSG_EXITS,
+            "seq": seq,
+            "frame": frame,
+            "map_id": map_id or (self._last_map.map_id if self._last_map else ""),
+            "candidates": list(candidates),
+            "source": source,
+            "t_capture_ns": time.monotonic_ns(),
+            "t_send_ns": time.monotonic_ns(),
+        })
+
+    def set_phase(self, name: str, reason: str = "",
+                  mission: Optional[Dict[str, Any]] = None) -> bool:
+        """Move the session between t1 (explore) and t2 (seek).
+
+        Optimistically local: the phase is set here and confirmed by the server's
+        reply.  The alternative — waiting for the confirmation — would leave the
+        robot in the old phase for a round trip at exactly the moment it has
+        decided to change what it is doing.
+        """
+        self.phase = name
+        if mission:
+            self.mission.update(mission)
+        return self._send({
+            "type": MSG_PHASE,
+            "phase": name,
+            "reason": reason,
+            "mission": self.mission,
+            "t_send_ns": time.monotonic_ns(),
+        })
+
     def _send_frame(self, img: Optional[np.ndarray], pre_encoded: Optional[bytes], cv2) -> None:
         t_capture_ns = time.monotonic_ns()
 
@@ -2190,9 +3107,13 @@ class RoboCamClient:
             except (IndexError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 log.warning("unparseable message from server: %s", exc)
                 continue
-            self._handle(header)
+            # Only map_update carries a payload back, but the framing is the
+            # same two frames in both directions, so the second is kept for
+            # every message rather than special-cased at the socket.
+            payload = parts[1] if len(parts) > 1 else b""
+            self._handle(header, payload)
 
-    def _handle(self, header: Dict[str, Any]) -> None:
+    def _handle(self, header: Dict[str, Any], payload: bytes = b"") -> None:
         mtype = header.get("type")
 
         if mtype == MSG_WELCOME:
@@ -2231,6 +3152,42 @@ class RoboCamClient:
                                     ", ".join(unknown))
                     log.info("server imu: bursts older than %.0f ms not fused",
                              server_imu.get("stale_after_ms", 0.0))
+
+                server = header.get("server", {})
+                server_odom = server.get("odom", {})
+                server_map = server.get("map", {})
+                # An older server has no opinion on either. Assume it wants them
+                # and let it answer with errors if not -- except that a v1 server
+                # answers an unknown type with a protocol error rather than a
+                # typed refusal, so the absence of the section is taken as "do
+                # not send" when we have something to send.
+                self._server_wants_odom = bool(server_odom.get("enabled", bool(server_odom)))
+                self._server_wants_map = bool(server_map.get("enabled", bool(server_map)))
+                self._server_sends_updates = bool(server_map.get("send_updates", False))
+
+                if self._odom_info and not self._server_wants_odom:
+                    log.warning("server is not accepting odometry -- the reconstruction "
+                                "cannot be placed on your map without it")
+                elif self._odom_info and server_odom.get("expect_frame"):
+                    expected = server_odom["expect_frame"]
+                    mine = self._odom_info.get("expect_frame") or self._odom_info.get("frame")
+                    if mine and mine != expected:
+                        log.warning("server expects poses in frame %r, this source "
+                                    "reports %r; it will refuse to compare across them",
+                                    expected, mine)
+
+                if self._map_info and not self._server_wants_map:
+                    log.warning("server is not accepting occupancy grids -- not uploading")
+                elif self._map_info and not self._server_sends_updates:
+                    log.info("server accepts the map but will not send patches back "
+                             "(compare or map.send_updates is off): the upload is "
+                             "still worth it for the comparison in its logs")
+
+                mission = server.get("mission", {})
+                if mission.get("phase") and mission["phase"] != self.phase:
+                    log.info("server puts this session in phase %s (we said %s)",
+                             mission["phase"], self.phase)
+                    self.phase = mission["phase"]
             else:
                 log.error("server rejected session: %s", header.get("message"))
                 self._stop = True
@@ -2310,6 +3267,165 @@ class RoboCamClient:
                     log.exception("on_imu_result callback raised")
             return
 
+        if mtype == MSG_ODOM_RESULT:
+            seq = int(header.get("seq", -1))
+            sent_at = self._pending_odom.pop(seq, None)
+            if sent_at is not None:
+                header["rtt_ms"] = round((time.monotonic() - sent_at) * 1000.0, 2)
+            if header.get("ok"):
+                self.odom_results_ok += 1
+                self._last_odom_summary = header.get("data", {}) or {}
+                warning = self._last_odom_summary.get("frame_warning")
+                if warning and warning != getattr(self, "_last_frame_warning", None):
+                    # Once per distinct warning, not once per pose: this arrives
+                    # at the frame rate and the message is a configuration
+                    # mistake, which does not become truer by repetition.
+                    self._last_frame_warning = warning
+                    log.warning("server on odometry: %s", warning)
+            else:
+                self.odom_results_bad += 1
+                if header.get("reason") == "odom_disabled":
+                    self._server_wants_odom = False
+                    log.warning("server refused a pose: %s",
+                                header.get("data", {}).get("error", ""))
+                else:
+                    log.warning("odom seq=%d not ok: %s %s", seq, header.get("reason"),
+                                header.get("data", {}).get("error", ""))
+            if self.on_odom_result is not None:
+                try:
+                    self.on_odom_result(header)
+                except Exception:
+                    log.exception("on_odom_result callback raised")
+            return
+
+        if mtype == MSG_MAP_RESULT:
+            seq = int(header.get("seq", -1))
+            sent_at = self._pending_maps.pop(seq, None)
+            if sent_at is not None:
+                header["rtt_ms"] = round((time.monotonic() - sent_at) * 1000.0, 2)
+            data = header.get("data", {}) or {}
+            if header.get("ok"):
+                self.map_results_ok += 1
+                self._last_map_summary = data
+                log.info("map seq=%d accepted: %.0f%% explored, %d occupied, "
+                         "compare %s", seq,
+                         100.0 * data.get("explored_fraction", 0.0),
+                         data.get("occupied", 0),
+                         "ready" if data.get("compare_ready")
+                         else "blocked: %s" % data.get("compare_blocked_by", "?"))
+            else:
+                self.map_results_bad += 1
+                if header.get("reason") == "map_disabled":
+                    self._server_wants_map = False
+                log.warning("map seq=%d not ok: %s %s", seq, header.get("reason"),
+                            data.get("error", ""))
+                # Let the next timer tick retry rather than waiting a full
+                # map_every_s from a send that never landed.
+                self._last_map_sent = 0.0
+            if self.on_map_result is not None:
+                try:
+                    self.on_map_result(header)
+                except Exception:
+                    log.exception("on_map_result callback raised")
+            return
+
+        if mtype == MSG_MAP_UPDATE:
+            self.map_updates_received += 1
+            if self._last_map is not None and header.get("map_id") not in ("", self._last_map.map_id):
+                # A patch for a map this robot has moved on from names cells in
+                # a coordinate system that no longer exists.  Dropping it is the
+                # only safe thing; applying it would corrupt the current map in a
+                # way nothing downstream could detect.
+                log.warning("dropping map_update for map_id %r; we are on %r",
+                            header.get("map_id"), self._last_map.map_id)
+                return
+            try:
+                cells = decode_map_patch(header, payload)
+            except (KeyError, ValueError, zlib.error) as exc:
+                log.warning("unusable map_update: %s", exc)
+                return
+            log.info("map_update: %d cells changed in a %dx%d patch at (%d, %d), "
+                     "merge=%s, agreement %.2f",
+                     header.get("cells_changed", 0), header.get("width", 0),
+                     header.get("height", 0), header.get("x0", 0), header.get("y0", 0),
+                     header.get("merge", MAP_MERGE_MAX),
+                     (header.get("data", {}) or {}).get("agreement", 0.0) or 0.0)
+            if self.on_map_update is not None:
+                try:
+                    self.on_map_update(header, cells)
+                except Exception:
+                    log.exception("on_map_update callback raised")
+            elif self.map_updates_received == 1:
+                log.warning("no on_map_update callback: the server is finding "
+                            "obstacles your scanner cannot see and nothing on this "
+                            "robot is merging them into the costmap")
+            return
+
+        if mtype == MSG_POSE_HINT:
+            self.pose_hints_received += 1
+            log.info("pose_hint: (%+.3f, %+.3f) m, %+.2f deg, %d inliers, "
+                     "confidence %.2f (%s) -- advisory",
+                     header.get("dx", 0.0), header.get("dy", 0.0),
+                     math.degrees(header.get("dyaw", 0.0)), header.get("inliers", 0),
+                     header.get("confidence", 0.0), header.get("method", "?"))
+            if self.on_pose_hint is not None:
+                try:
+                    self.on_pose_hint(header)
+                except Exception:
+                    log.exception("on_pose_hint callback raised")
+            return
+
+        if mtype == MSG_FOUND:
+            self.founds_received += 1
+            approach = header.get("approach") or {}
+            log.info("%s %r at (%.2f, %.2f) confidence %.2f; approach (%.2f, %.2f) "
+                     "facing %+.0f deg -- %s",
+                     "FOUND" if header.get("found") else "NOT FOUND:",
+                     header.get("target", ""), header.get("x", 0.0), header.get("y", 0.0),
+                     header.get("confidence", 0.0),
+                     approach.get("x", header.get("x", 0.0)),
+                     approach.get("y", header.get("y", 0.0)),
+                     math.degrees(approach.get("yaw", header.get("yaw", 0.0))),
+                     header.get("rationale", "") or header.get("decider", ""))
+            if self.on_found is not None:
+                try:
+                    self.on_found(header)
+                except Exception:
+                    log.exception("on_found callback raised")
+            elif self.founds_received == 1:
+                log.warning("no on_found callback: the server has located the target "
+                            "and nothing on this robot is driving to it")
+            return
+
+        if mtype == MSG_EXITS_RESULT:
+            data = header.get("data", {}) or {}
+            if header.get("ok"):
+                log.info("exits ranked by %s: chose %r of %d",
+                         data.get("method", "?"), header.get("chosen", ""),
+                         data.get("received", 0))
+            else:
+                log.warning("exits not ok: %s %s", header.get("reason"),
+                            data.get("error", ""))
+            if self.on_exits_result is not None:
+                try:
+                    self.on_exits_result(header)
+                except Exception:
+                    log.exception("on_exits_result callback raised")
+            return
+
+        if mtype == MSG_PHASE:
+            if header.get("accepted") is False:
+                log.warning("server refused phase %r: %s",
+                            header.get("phase"), header.get("reason", ""))
+                return
+            if header.get("phase") and header["phase"] != self.phase:
+                log.info("server moved this session to phase %s (%s)",
+                         header["phase"], header.get("reason", ""))
+                self.phase = header["phase"]
+            if header.get("mission"):
+                self.mission.update(header["mission"])
+            return
+
         if mtype == MSG_PONG:
             return
         if mtype == MSG_ERROR:
@@ -2324,7 +3440,7 @@ class RoboCamClient:
             self.sent, self.results_ok, self.results_bad, self.skipped_backpressure,
             self.sent / elapsed if elapsed > 0 else 0.0, rtt, len(self._pending),
             self._lidar_status(elapsed),
-            self._imu_status(elapsed),
+            self._imu_status(elapsed) + self._map_status(elapsed),
         )
         self.sent = 0
         self.results_ok = 0
@@ -2339,8 +3455,39 @@ class RoboCamClient:
         self.imu_results_ok = 0
         self.imu_results_bad = 0
         self.imu_dropped = 0
+        self.odom_sent = 0
+        self.odom_results_ok = 0
+        self.odom_results_bad = 0
         self._rtt_sum = 0.0
         self._rtt_n = 0
+
+    def _map_status(self, elapsed: float) -> str:
+        """The odometry and map half of the status line.
+
+        Two numbers earn their place here.  ``usable`` says whether the server
+        can actually compare anything — a robot streaming poses and grids at a
+        server that is refusing to relate them looks, from every other counter,
+        exactly like one that is working.  And the count of patches received is
+        the only evidence on this side that the whole right-hand column of the
+        system diagram is producing anything at all.
+        """
+        if not (self._odom_info or self._map_info):
+            return ""
+        parts = []
+        if self._odom_info:
+            rate = self.odom_sent / elapsed if elapsed > 0 else 0.0
+            usable = self._last_odom_summary.get("usable_for_compare")
+            parts.append("odom %.0f Hz ok=%d%s" % (
+                rate, self.odom_results_ok,
+                "" if usable is None else (" usable" if usable else " NOT-USABLE")))
+        if self._map_info:
+            parts.append("map sent=%d ok=%d" % (self.maps_sent, self.map_results_ok))
+        if self.map_updates_received or self.pose_hints_received:
+            parts.append("back: %d patch, %d hint" % (
+                self.map_updates_received, self.pose_hints_received))
+        if self.founds_received:
+            parts.append("FOUND x%d" % self.founds_received)
+        return " | " + " ".join(parts)
 
     def _lidar_status(self, elapsed: float) -> str:
         """The LiDAR half of the status line, empty when there is no scanner."""
@@ -2500,13 +3647,63 @@ def build_imu_source(args) -> Optional[ImuSource]:
     return None
 
 
+def build_odom_source(args) -> Optional[OdomSource]:
+    """Open the pose source, or return None if there is not one to open.
+
+    ``auto`` tries the ROS 2 topic and gives up.  There is no serial fallback and
+    there cannot be: a pose in the map frame is SLAM's output, not a device's,
+    and nothing this client could read off a port would be it.
+
+    Like the scanner, ``auto`` never substitutes the synthetic source.  A robot
+    whose reconstruction is being placed by an invented pose is worse than one
+    whose reconstruction is not being placed at all.
+    """
+    mode = getattr(args, "odom", "off")
+    if mode == "off":
+        return None
+    if mode == "synthetic":
+        return SyntheticOdomSource(hz=args.odom_hz, frame=args.odom_frame)
+    if mode == "ros2":
+        return Ros2OdomSource(args.odom_topic, expect_frame=args.odom_frame)
+
+    log.info("odom: auto — trying ROS 2 topic %s", args.odom_topic)
+    try:
+        return Ros2OdomSource(args.odom_topic, require_publisher=True,
+                              expect_frame=args.odom_frame)
+    except Exception as exc:
+        log.warning("no odometry found (%s). The server cannot place the "
+                    "reconstruction on your map without it.", exc)
+        return None
+
+
+def build_map_source(args) -> Optional[MapSource]:
+    """Open the occupancy grid source, or return None if there is not one."""
+    mode = getattr(args, "map", "off")
+    if mode == "off":
+        return None
+    if mode == "synthetic":
+        return SyntheticMapSource(resolution=args.map_resolution)
+    if mode == "ros2":
+        return Ros2MapSource(args.map_topic)
+
+    log.info("map: auto — trying ROS 2 topic %s", args.map_topic)
+    try:
+        return Ros2MapSource(args.map_topic, require_publisher=True)
+    except Exception as exc:
+        log.warning("no occupancy grid found (%s). The server will reconstruct "
+                    "but has nothing to compare against.", exc)
+        return None
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="robocam-client",
         description="Stream the robot's webcam to the processing server.",
     )
-    p.add_argument("-s", "--server", default="tcp://10.128.17.196:5555",
-                   help="server endpoint (default: %(default)s)")
+    p.add_argument("-s", "--server", default="tcp://127.0.0.1:5555",
+                   help="server endpoint (default: %(default)s — the local end of "
+                        "mecanumbot-deep3r-tunnel, which is where the server is from "
+                        "the robot. No cluster address is reachable from here.)")
     p.add_argument("--client-id", default="orin", help="identifies this robot to the server")
     p.add_argument("--source", choices=["camera", "synthetic", "gst-jpeg", "none"], default="camera",
                    help="camera: OpenCV capture; synthetic: test pattern, no camera needed; "
@@ -2589,6 +3786,47 @@ def main(argv=None) -> int:
                      help="imu bursts allowed to be awaiting a result before pausing")
     imu.add_argument("--print-imu", action="store_true",
                      help="print every imu result as JSON")
+
+    nav = p.add_argument_group(
+        "odometry, map and mission",
+        "the right-hand column of the system diagram: the robot's pose and its "
+        "SLAM grid go up so that the server can compare its reconstruction "
+        "against them, and what that comparison finds comes back as map patches "
+        "and — in t2 — as the located target",
+    )
+    nav.add_argument("--odom", choices=["off", "auto", "ros2", "synthetic"], default="off",
+                     help="how to read the robot's pose (default: %(default)s). Without "
+                          "it the server cannot place its reconstruction on your map.")
+    nav.add_argument("--odom-topic", default="/amcl_pose",
+                     help="ROS 2 pose topic (default: %(default)s). Note /odom is dead "
+                          "reckoning; the map-frame pose is what this link wants, and "
+                          "on most stacks that comes from the localiser instead.")
+    nav.add_argument("--odom-frame", default="map",
+                     help="frame the poses are expected in (default: %(default)s). The "
+                          "server refuses to compare a cloud placed with an odom-frame "
+                          "pose against a map-frame grid.")
+    nav.add_argument("--odom-hz", type=float, default=20.0, help="synthetic odometry rate")
+    nav.add_argument("--max-inflight-odom", type=int, default=2,
+                     help="poses allowed to be awaiting a result before dropping")
+    nav.add_argument("--map", choices=["off", "auto", "ros2", "synthetic"], default="off",
+                     help="how to read the occupancy grid (default: %(default)s)")
+    nav.add_argument("--map-topic", default="/map",
+                     help="ROS 2 OccupancyGrid topic (default: %(default)s). Subscribed "
+                          "transient-local, which is what a latched map needs.")
+    nav.add_argument("--map-every", type=float, default=5.0,
+                     help="seconds between grid uploads (default: %(default)s). A room "
+                          "does not change in five seconds; the images of it do.")
+    nav.add_argument("--map-resolution", type=float, default=0.05,
+                     help="synthetic map resolution, metres per cell")
+    nav.add_argument("--phase", choices=[PHASE_EXPLORE, PHASE_SEEK], default=PHASE_EXPLORE,
+                     help="t1 explore and map, t2 seek the target (default: %(default)s)")
+    nav.add_argument("--target", default="",
+                     help="what t2 is looking for, in words. Free text: it is the prompt "
+                          "for the server's decision stage, so 'the red mug on the desk' "
+                          "beats 'mug'.")
+    nav.add_argument("--print-map-updates", action="store_true",
+                     help="print every map_update header as JSON (without the cells)")
+
     args = p.parse_args(argv)
 
     logging.basicConfig(
@@ -2609,6 +3847,20 @@ def main(argv=None) -> int:
         if args.print_imu:
             print(json.dumps(result, separators=(",", ":")), flush=True)
 
+    def on_map_update(header: Dict[str, Any], cells: np.ndarray) -> None:
+        # This client has no costmap of its own to merge into -- it is a data
+        # path, not a navigation stack -- so it reports and hands over.  A robot
+        # that wants the obstacles applied imports RoboCamClient and passes its
+        # own callback, which then calls merge_map_patch against the map it owns.
+        if args.print_map_updates:
+            print(json.dumps(header, separators=(",", ":")), flush=True)
+        occupied = int(np.count_nonzero(cells >= 65))
+        log.info("map_update carried %d occupied cells; nothing on this client "
+                 "merges them (pass on_map_update= to do that)", occupied)
+
+    def on_found(header: Dict[str, Any]) -> None:
+        print(json.dumps(header, separators=(",", ":")), flush=True)
+
     client = RoboCamClient(
         server=args.server,
         client_id=args.client_id,
@@ -2620,6 +3872,12 @@ def main(argv=None) -> int:
         on_scan_result=on_scan_result,
         max_inflight_imu=args.max_inflight_imu,
         on_imu_result=on_imu_result,
+        max_inflight_odom=args.max_inflight_odom,
+        map_every_s=args.map_every,
+        on_map_update=on_map_update,
+        on_found=on_found,
+        phase=args.phase,
+        mission={"target": args.target} if args.target else {},
     )
 
     signal.signal(signal.SIGINT, lambda *_: client.stop())
@@ -2653,8 +3911,39 @@ def main(argv=None) -> int:
         source.close()
         return 1
 
+    try:
+        odom_source = build_odom_source(args)
+    except Exception as exc:
+        # An explicitly requested pose source that will not open is a failure,
+        # on the same bargain as the scanner and the IMU.
+        log.error("could not open odometry (%s): %s", args.odom, exc)
+        for opened in (imu_source, scan_source):
+            if opened is not None:
+                opened.close()
+        source.close()
+        return 1
+
+    try:
+        map_source = build_map_source(args)
+    except Exception as exc:
+        log.error("could not open the map (%s): %s", args.map, exc)
+        for opened in (odom_source, imu_source, scan_source):
+            if opened is not None:
+                opened.close()
+        source.close()
+        return 1
+
+    if map_source is not None and odom_source is None:
+        # Not fatal, but it is the configuration that produces the most
+        # convincing silence: grids arrive, the server holds them, and nothing
+        # is ever compared because there is no pose to place a cloud with.
+        log.warning("uploading a map with --odom off: the server will hold the "
+                    "grid and compare nothing, because it has no pose to place "
+                    "the reconstruction with")
+
     client.run(source, duration=args.duration, status_every=args.status_every,
-               scan_source=scan_source, imu_source=imu_source)
+               scan_source=scan_source, imu_source=imu_source,
+               odom_source=odom_source, map_source=map_source)
     return 0
 
 

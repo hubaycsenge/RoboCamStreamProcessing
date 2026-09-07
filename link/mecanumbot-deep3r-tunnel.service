@@ -1,10 +1,14 @@
 # Robot-side systemd unit. Forward tunnel for the RoboCam data path: makes the
 # server's ZeroMQ port reachable from the robot as 127.0.0.1:5555.
 #
-# Why this is needed at all: the robot sits on the lab WiFi (192.168.1.0/24)
-# behind the router's NAT. Nothing outside can dial in, so the robot dials out
+# Why this is needed at all: the robot sits on the lab WiFi behind a router's
+# NAT -- 192.168.0.240 on the 192.168.0.1 router, 192.168.1.240 on the
+# 192.168.1.1 one. Nothing outside can dial in on either, so the robot dials out
 # -- the only direction NAT allows -- and forwards the server port back to
 # itself. The client then talks to tcp://127.0.0.1:5555.
+#
+# That the robot dials out is also why this unit needs no edit when the robot
+# moves between the two routers: nothing here names the robot's own address.
 #
 # Why nipg1 and not nipg36. This unit used to target nipg36's public SSH port
 # (10113), because nipg36's LAN address 10.128.17.196:5555 is UNREACHABLE from

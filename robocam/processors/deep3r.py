@@ -43,6 +43,26 @@ The recurrent state is the map.  Three consequences the config has to face:
   the mechanism built in: a view flagged ``reset`` restores the initial state,
   so a reset costs nothing beyond the map it discards.
 
+Comparing against the robot's own map
+-------------------------------------
+The cloud is only half of what the system diagram asks for.  The other half is
+the ``Compare`` box: the robot uploads the 2D occupancy grid its SLAM is
+building, and this processor puts each cloud into that grid's frame and asks what
+the two disagree about.  What comes back is a ``map_update`` — the cells the
+reconstruction says are occupied and the LiDAR's single horizontal plane could
+not see, which is to say the table tops — and, optionally, a ``pose_hint``.
+
+It runs here, in the worker, rather than on the IO thread, for the reason
+everything expensive does: it is numpy over a hundred thousand points and it
+must not sit in front of the socket.  It runs *in this processor* rather than in
+a separate stage because the cloud in its own world frame and the pose that
+produced it exist together only here — after the wire encoding, the cloud has
+been quantised and the camera pose is a list of lists.
+
+Everything about *whether* to send what it finds is the server's: see
+``StreamServer._send_announcements`` for the switches and the rate limits.  This
+processor decides only whether there is anything to say.
+
 Wire size
 ---------
 A 512-mode pointmap is ~200k points; as JSON that is tens of megabytes per
@@ -57,15 +77,17 @@ of what was seen, instead of clipping a long corridor.
 from __future__ import annotations
 
 import base64
-import math
 import os
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
+from .. import wire
+from ..compare import CameraMount, compare
+from ..occupancy import encode_cells
 from .base import Frame, Processor
 
 # Millimetre-ish resolution is far finer than the model's own accuracy, so 16
@@ -139,6 +161,12 @@ class Deep3RProcessor(Processor):
         LiDAR's forward range.  CUT3R claims metric scale; this is the cheapest
         possible independent check of that claim, and it is the number to look
         at first when a map comes out plausibly shaped but wrongly sized.
+    compare_map:
+        Run the comparison against the robot's occupancy grid when the frame
+        carries both a grid and a pose.  The geometry it needs — the camera
+        mount, the height slice — comes from the server config through
+        ``configure``, not from these options, because it describes the robot
+        rather than the model and two copies of it could disagree.
     """
 
     name = "deep3r"
@@ -157,6 +185,7 @@ class Deep3RProcessor(Processor):
         reset_on_gap: int = 0,
         colors: bool = True,
         lidar_check: bool = True,
+        compare_map: bool = True,
         **options: Any,
     ) -> None:
         super().__init__(
@@ -164,7 +193,7 @@ class Deep3RProcessor(Processor):
             every_n=every_n, min_conf=min_conf, voxel_m=voxel_m,
             max_points=max_points, reset_every=reset_every,
             reset_on_gap=reset_on_gap, colors=colors, lidar_check=lidar_check,
-            **options,
+            compare_map=compare_map, **options,
         )
         self.cut3r_root = os.path.expanduser(str(cut3r_root))
         self.weights = os.path.expanduser(str(weights))
@@ -178,6 +207,12 @@ class Deep3RProcessor(Processor):
         self.reset_on_gap = int(reset_on_gap) or (4 * self.every_n)
         self.colors = bool(colors)
         self.lidar_check = bool(lidar_check)
+        self.compare_map = bool(compare_map)
+        # Filled in by configure(); the defaults describe a camera at 45 cm
+        # looking level, which is this robot with its neck at rest.
+        self._mount = CameraMount()
+        self._compare_cfg = None
+        self._map_cfg = None
 
         # Everything below is created in setup(), on the worker thread.
         self._torch = None
@@ -199,6 +234,29 @@ class Deep3RProcessor(Processor):
         self._lock = threading.Lock()
 
     # -- lifecycle -----------------------------------------------------------
+
+    def configure(self, lidar_cfg: Any, imu_cfg: Any = None, config: Any = None) -> None:
+        """Take the camera mount and the height slice from the server config.
+
+        These are tape-measure facts about the robot, not tunings of the model,
+        and the failure they cause is the quiet kind: a camera height that is
+        10 cm wrong puts every reconstructed surface 10 cm off in z, which moves
+        a table top out of the obstacle slice entirely and produces a comparison
+        that runs perfectly and finds nothing.
+        """
+        if config is None:
+            return
+        self._compare_cfg = getattr(config, "compare", None)
+        self._map_cfg = getattr(config, "map", None)
+        if self._compare_cfg is not None:
+            self._mount = CameraMount(
+                x=self._compare_cfg.camera_x,
+                y=self._compare_cfg.camera_y,
+                z=self._compare_cfg.camera_z,
+                roll=self._compare_cfg.camera_roll,
+                pitch=self._compare_cfg.camera_pitch,
+                yaw=self._compare_cfg.camera_yaw,
+            )
 
     def setup(self) -> None:
         """Import CUT3R, load the checkpoint and warm the kernels up.
@@ -339,7 +397,8 @@ class Deep3RProcessor(Processor):
         infer_ms = (time.monotonic() - t0) * 1000.0
 
         t1 = time.monotonic()
-        cloud = self._encode_cloud(pts, rgb, conf)
+        kept_pts, kept_rgb, kept_conf, counts = self._reduce(pts, rgb, conf)
+        cloud = self._pack_cloud(kept_pts, kept_rgb, kept_conf, counts)
         encode_ms = (time.monotonic() - t1) * 1000.0
 
         self._frames_in_state += 1
@@ -356,7 +415,82 @@ class Deep3RProcessor(Processor):
         }
         if self.lidar_check:
             data["scale_check"] = self._scale_check(frame, pts, conf)
+        if self.compare_map:
+            data["compare"] = self._compare_with_map(frame, kept_pts, pose_c2w)
         return data
+
+    # -- the Compare box -----------------------------------------------------
+
+    def _compare_with_map(self, frame: Frame, points, pose_c2w) -> Dict[str, Any]:
+        """Diff this cloud against the robot's occupancy grid and announce the news.
+
+        Returns the statistics either way — including when it could not run, and
+        why.  That is the point of returning a dict rather than None: "no map on
+        the server", "no pose to place the cloud with" and "compared, found
+        nothing" are three different situations that produce the same silence,
+        and the first two are configuration mistakes the robot's operator can fix
+        in a minute if told.
+        """
+        if self._compare_cfg is None or not self._compare_cfg.enabled:
+            return {"ran": False, "why": "compare is disabled on the server"}
+        if frame.grid is None:
+            return {"ran": False, "why": "the robot has not uploaded an occupancy grid"}
+        if frame.odom is None:
+            return {"ran": False,
+                    "why": "no pose fresh enough to place the cloud in the map frame"}
+        if points.shape[0] == 0:
+            return {"ran": False, "why": "no points survived the confidence filter"}
+
+        cfg = self._compare_cfg
+        result = compare(
+            points, pose_c2w, frame.odom, frame.grid, self._mount,
+            z_min=cfg.z_min, z_max=cfg.z_max, min_points=cfg.min_points,
+            occupied_value=(self._map_cfg.occupied_value if self._map_cfg else 100),
+            min_new_cells=(self._map_cfg.min_update_cells if self._map_cfg else 4),
+            hint=cfg.send_hints, search_cells=cfg.search_cells,
+        )
+        stats = dict(result.stats)
+        stats["ran"] = bool(result.stats.get("placed"))
+        stats["odom_age_ms"] = round(frame.odom_age_ms, 1)
+        stats["grid_age_ms"] = round(frame.grid_age_ms, 1)
+
+        patch = result.patch
+        if patch is not None:
+            payload = encode_cells(patch.cells, wire.MAP_ENC_I8_ZLIB)
+            frame.announce(
+                wire.map_update(
+                    # seq is stamped by the server, which owns the counter.
+                    seq=0,
+                    width=patch.width, height=patch.height,
+                    resolution=patch.resolution,
+                    encoding=wire.MAP_ENC_I8_ZLIB,
+                    x0=patch.x0, y0=patch.y0,
+                    origin=patch.origin, frame=patch.frame,
+                    map_id=frame.grid.map_id,
+                    merge=(self._map_cfg.merge if self._map_cfg else wire.MAP_MERGE_MAX),
+                    cells_changed=int(stats.get("new_cells", 0)),
+                    from_frame_seq=frame.seq,
+                    cloud_map_id=self._map_id,
+                    data={"agreement": stats.get("agreement"),
+                          "over_free": stats.get("over_free"),
+                          "z_slice": [cfg.z_min, cfg.z_max]},
+                ),
+                payload,
+            )
+            stats["announced_patch_bytes"] = len(payload)
+
+        shift = stats.get("shift")
+        if shift:
+            frame.announce(wire.pose_hint(
+                seq=0,
+                dx=shift["dx"], dy=shift["dy"], dyaw=shift["dyaw"],
+                confidence=shift["confidence"], inliers=shift["inliers"],
+                method=shift["method"], frame=frame.grid.frame,
+                map_id=frame.grid.map_id, from_frame_seq=frame.seq,
+                data={"baseline_inliers": shift.get("baseline_inliers"),
+                      "search_cells": shift.get("search_cells")},
+            ))
+        return stats
 
     def _reset_state(self) -> None:
         self._state = None
@@ -465,8 +599,17 @@ class Deep3RProcessor(Processor):
 
     # -- cloud reduction -----------------------------------------------------
 
-    def _encode_cloud(self, pts, rgb, conf) -> Dict[str, Any]:
-        """Filter, voxelise, quantise and base64 one frame's points."""
+    def _reduce(self, pts, rgb, conf):
+        """Confidence-filter, voxelise and cap.  Returns (pts, rgb, conf, counts).
+
+        Split out from the packing because the *reduced* points are what the
+        comparison against the robot's map wants: already gated to the surfaces
+        the model was sure about, already thinned to one point per voxel, and
+        still in metres rather than quantised.  Comparing against the packed
+        cloud instead would mean decoding what was just encoded, and comparing
+        against the raw pointmap would mean carrying the model's low-confidence
+        sky into the robot's costmap.
+        """
         total = int(pts.shape[0])
         keep = np.isfinite(pts).all(axis=1) & (conf >= self.min_conf)
         pts, conf = pts[keep], conf[keep]
@@ -483,6 +626,16 @@ class Deep3RProcessor(Processor):
             pts, conf = pts[order], conf[order]
             if rgb is not None:
                 rgb = rgb[order]
+        return pts, rgb, conf, (total, after_conf)
+
+    def _encode_cloud(self, pts, rgb, conf) -> Dict[str, Any]:
+        """Filter, voxelise, quantise and base64 one frame's points."""
+        pts, rgb, conf, counts = self._reduce(pts, rgb, conf)
+        return self._pack_cloud(pts, rgb, conf, counts)
+
+    def _pack_cloud(self, pts, rgb, conf, counts) -> Dict[str, Any]:
+        """Quantise and base64 an already-reduced cloud."""
+        total, after_conf = counts
 
         out: Dict[str, Any] = {
             "n_points": int(pts.shape[0]),
@@ -493,6 +646,35 @@ class Deep3RProcessor(Processor):
             # CUT3R's world frame: metric, right-handed, anchored on the first
             # frame of this map_id. Relating it to odom is the robot's job.
             "frame": "cut3r_world",
+            # Everything a `sensor_msgs/PointCloud2` needs that is not in the
+            # bytes themselves.  The robot republishes this cloud on a ROS topic
+            # -- the "Pointcloud2" box in the system diagram -- and without a
+            # declared layout it would have to hardcode one here, which is
+            # exactly the kind of duplicated constant that survives a change at
+            # this end and produces a cloud read as garbage at the other.
+            #
+            # Note this describes the cloud AFTER the robot has dequantised it
+            # to float32 metres, not the uint16 on the wire: PointCloud2 has no
+            # 16-bit-with-an-origin encoding, so the conversion happens on the
+            # robot and this is what it converts to.
+            "pc2": {
+                "height": 1,             # unordered: the voxel grid destroyed the
+                                         # image raster, so there are no rows
+                "width": int(pts.shape[0]),
+                "is_bigendian": False,
+                "is_dense": True,        # every point is finite; NaNs were filtered
+                "point_step": 16 if rgb is not None else 12,
+                "fields": (
+                    [{"name": "x", "offset": 0, "datatype": 7, "count": 1},
+                     {"name": "y", "offset": 4, "datatype": 7, "count": 1},
+                     {"name": "z", "offset": 8, "datatype": 7, "count": 1}]
+                    # datatype 7 is FLOAT32, 6 is UINT32.  rgb packed into one
+                    # uint32 is what RViz and pcl expect; a float32 "rgb" field
+                    # is the older convention and is a trap in Python.
+                    + ([{"name": "rgb", "offset": 12, "datatype": 6, "count": 1}]
+                       if rgb is not None else [])
+                ),
+            },
         }
         if pts.shape[0] == 0:
             out.update({"origin": [0.0, 0.0, 0.0], "scale": 0.0, "xyz_u16": "", "rgb_u8": ""})

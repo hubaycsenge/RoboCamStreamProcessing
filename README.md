@@ -8,14 +8,20 @@ The server is a Slurm job on whatever node has a card free; the robot reaches it
 through a fixed SSH rendezvous on the `nipg1` login node, so which node the job
 landed on is never the robot's problem. See [Networking](#networking).
 
-**Status: transport layer complete and measured; the first model is in.**
-`stats` still answers "are frames actually arriving, and what shape are they?"
-and remains the default, because it needs no weights and so keeps the transport
-checkable independently of any model. `deep3r` runs CUT3R over the stream and
-returns a metric point cloud per frame — see
+**Status: transport layer complete and measured; the first model is in; the map
+loop is wired.** `stats` still answers "are frames actually arriving, and what
+shape are they?" and remains the default, because it needs no weights and so
+keeps the transport checkable independently of any model. `deep3r` runs CUT3R
+over the stream and returns a metric point cloud per frame — see
 [Reconstruction](#reconstruction-the-deep3r-processor). YOLO and the rest plug
 in the same way, without the wire protocol changing. See
 [Adding a model](#adding-a-model).
+
+Protocol 2 added the second half of the system diagram: the robot's **pose** and
+its **2D occupancy grid** go up, the server's `compare` stage diffs the
+reconstruction against that grid, and what it finds comes back as **map
+patches** — obstacles the LiDAR's single horizontal plane cannot see — plus, in
+the seek phase, the located target. See [The map loop](#the-map-loop).
 
 ```text
   Jetson Orin Nano                         GPU node (Slurm job)
@@ -46,6 +52,11 @@ freeze.
 **Every frame gets exactly one reply**, including dropped ones (`reason:
 "dropped"`). The client sizes its in-flight window from outstanding replies, so
 a silently discarded frame would slowly starve the sender.
+
+Three server messages are the exception, and they are the ones the map loop is
+made of: `map_update`, `pose_hint` and `found` are *announcements*. They are
+produced by a stage on the server, not requested by the robot, and they arrive
+when that stage finishes.
 
 ---
 
@@ -170,17 +181,62 @@ the sensor's. Bursts that the client's own queue had to discard are counted and
 the count travels with the next one, so a gap shows up as a number rather than as
 a rate that quietly came out low.
 
-Or use it as a library:
+Pose, map and mission flags (the map loop — see
+[The map loop](#the-map-loop)):
+
+```bash
+--odom auto                 # the robot's pose; off by default
+--odom-topic /amcl_pose     # NOT /odom: that is dead reckoning, see below
+--odom-frame map            # the frame the server will insist on
+--map auto                  # the SLAM occupancy grid; off by default
+--map-topic /map            # subscribed transient-local, which a latched map needs
+--map-every 5               # seconds between uploads
+--phase t1                  # t1 explore and map, t2 seek
+--target 'the red mug on the desk'   # what t2 is looking for, in words
+--print-map-updates         # dump every map_update header as JSON
+```
+
+**`--odom-topic` defaults to the localiser, not to `/odom`.** `/odom` is dead
+reckoning — smooth, continuous, and wrong by however much the wheels have
+slipped. The occupancy grid is drawn in the `map` frame, and a cloud placed with
+an odom-frame pose and compared against a map-frame grid finds differences
+everywhere and calls them furniture. The server refuses that comparison rather
+than absorbing it, and says so on every pose reply.
+
+Or use it as a library — which is how the obstacles actually reach a costmap.
+The standalone client decodes a `map_update` and reports it; the node that owns
+the robot's map merges it:
 
 ```python
-from robocam_client import RoboCamClient, OpenCVSource
+from robocam_client import (RoboCamClient, OpenCVSource, Ros2OdomSource,
+                            Ros2MapSource, merge_map_patch)
 
 def on_result(r):
     if r["ok"]:
         print(r["width"], r["height"], r["data"]["session_fps"], r["rtt_ms"])
 
-client = RoboCamClient("tcp://127.0.0.1:5555", on_result=on_result)
-client.run(OpenCVSource("0", 1280, 720, 30))
+def on_map_update(header, cells):
+    # my_grid is the int8 (height, width) array this node owns.
+    merge_map_patch(my_grid, cells, header["x0"], header["y0"], header["merge"])
+
+def on_found(header):
+    seek_behaviour_tree.goto(header["approach"])
+
+client = RoboCamClient("tcp://127.0.0.1:5555", on_result=on_result,
+                       on_map_update=on_map_update, on_found=on_found)
+client.run(OpenCVSource("0", 1280, 720, 30),
+           odom_source=Ros2OdomSource("/amcl_pose"),
+           map_source=Ros2MapSource("/map"))
+```
+
+Exits are not a source with a thread — they come from whatever is doing frontier
+detection, and, crucially, from what *that* node remembers about which ones have
+already been tried. So they go up through a call:
+
+```python
+client.send_exits([{"id": "door-3", "x": 4.1, "y": 0.2, "yaw": 0.0,
+                    "width_m": 0.9, "status": "open"}])
+client.set_phase("t2", reason="map coverage 92%")
 ```
 
 `--source gst-jpeg` is worth using once the camera works. OpenCV decodes the
@@ -254,13 +310,13 @@ not producing).
 Worth being blunt about, because the temptation to treat it as a pose source is
 strong and the failure is silent:
 
-* **Attitude is honest.** Roll and pitch are observable — gravity is a permanent
+- **Attitude is honest.** Roll and pitch are observable — gravity is a permanent
   reference — so "the robot is tipping" or "this ramp is 8°" is real.
-* **Yaw is not.** Nothing in a gyro fixes an absolute heading, so `yaw_deg` has an
+- **Yaw is not.** Nothing in a gyro fixes an absolute heading, so `yaw_deg` has an
   arbitrary origin and drifts degrees per minute. Use `yaw_rate_dps` for control.
   The magnetometer would fix it in principle and does not in practice: it sits
   centimetres from four motors whose field swamps the Earth's.
-* **Position is not, at all.** Double-integrating this accelerometer gives metres
+- **Position is not, at all.** Double-integrating this accelerometer gives metres
   of error in seconds. Wheel odometry and the LiDAR are the position sensors.
 
 Axes follow the ROS body convention the OpenCR firmware uses: **x forward, y
@@ -313,13 +369,27 @@ and negligible next to a JPEG. Only `frame` messages carry a payload.
 
 | Message | Direction | Meaning |
 | --- | --- | --- |
-| `hello` | → server | opens a session, declares codec and geometry |
+| `hello` | → server | opens a session, declares codec, geometry, sensors, phase |
 | `welcome` | → robot | accepted (or rejected, with a reason) |
 | `frame` | → server | one encoded image |
 | `result` | → robot | exactly one per frame |
+| `scan` / `scan_result` | both | one LiDAR revolution, and its summary |
+| `imu` / `imu_result` | both | a burst of inertial samples, and its summary |
+| `odom` / `odom_result` | both | one pose, and whether the server can use it |
+| `map` / `map_result` | both | the 2D occupancy grid, and what the server made of it |
+| `exits` / `exits_result` | both | frontier candidates, and the server's ranking |
+| `phase` | both | move between `t1` (explore) and `t2` (seek) |
+| `map_update` | → robot | **announcement**: cells `compare` wants merged |
+| `pose_hint` | → robot | **announcement**: a correction *offered* to SLAM |
+| `found` | → robot | **announcement**: the target, and where to go for it |
 | `ping` / `pong` | both | liveness |
 | `bye` | both | graceful close |
 | `error` | → robot | malformed request |
+
+`PROTOCOL_VERSION` is 2. Everything v2 added is additive, so the server accepts
+a v1 client — it simply never sends a map and never hears a `map_update`. A
+version outside `1..2` is still refused, because an unknown version may mean
+something different by a field name the server thinks it recognises.
 
 A `result` header:
 
@@ -341,7 +411,15 @@ claimed — that is how you catch a camera that silently renegotiated its format
 appear; everything outside it stays the same when models are added.
 
 `reason` is one of `ok`, `dropped`, `decode_failed`, `processor_failed`,
-`unsupported_codec`. Only `ok` means the frame was processed.
+`unsupported_codec`, `bad_scan`, `lidar_disabled`, `bad_imu`, `imu_disabled`,
+`bad_odom`, `odom_disabled`, `bad_map`, `map_disabled`, `map_too_large`,
+`bad_exits`, `bad_phase`. Only `ok` means the message was processed.
+
+A result also carries `scan_seq`, `imu_seq`, `odom_seq` and `map_seq` when one
+of those was attached to the frame. Their **absence is the signal**: no
+`odom_seq` means nothing the server derived from that frame could be placed in
+the robot's map frame, which is a different thing from a comparison that ran and
+found nothing.
 
 **Clocks are never compared across machines.** The Orin and the server have
 unrelated monotonic clocks, so `t_capture_ns` and `t_send_ns` are echoed back
@@ -370,13 +448,37 @@ The two that matter most:
   `newest` if a model needs strictly consecutive frames, which MASt3R and VGGT
   may well want.
 
+And two that describe the robot rather than a preference, so they are worth
+measuring rather than accepting:
+
+- `compare.camera_z` (default 0.45) — the camera's height above the floor, in
+  metres. Wrong here puts every reconstructed surface at the wrong height, which
+  moves a table top out of `compare.z_min .. z_max` entirely and produces a
+  comparison that runs perfectly and finds nothing.
+- `odom.expect_frame` (default `map`) — the frame poses must arrive in. See
+  [The map loop](#the-map-loop).
+
 ## Networking
 
 The server binds `0.0.0.0:5555`. **The robot does not dial a cluster address**,
-and never could: it sits behind the lab router's NAT at `192.168.1.240`, so
-nothing outside can reach in and no cluster IP is reachable from it. Earlier
-versions of this section said the robot connects to `10.128.17.196:5555` — that
-was wrong, and `link/README.md` has the measured evidence.
+and never could: it sits behind a lab router's NAT, so nothing outside can reach
+in and no cluster IP is reachable from it. Earlier versions of this section said
+the robot connects to `10.128.17.196:5555` — that was wrong, and
+`link/README.md` has the measured evidence.
+
+**The lab has two routers and the robot's address depends on which it joined:**
+
+| router | robot |
+| --- | --- |
+| `192.168.0.1` | `192.168.0.240` |
+| `192.168.1.1` | `192.168.1.240` |
+
+The last octet is a DHCP reservation, so only the third octet moves. Nothing on
+the data path cares which — both tunnels are opened *by the robot*, so its own
+address is never dialled from outside, and no config here names it. The one
+command that does need it is the laptop ad-hoc tunnel used for first-time setup,
+and `link/robot-addr.sh` probes both and prints whichever answers. `link/netcheck.sh`
+also reports which router it is on, and whether the reservation actually applied.
 
 What actually happens is a two-leg SSH bridge meeting on a fixed rendezvous port
 on **nipg1**, the login node:
@@ -634,6 +736,111 @@ range when a scan is attached. CUT3R's metric claim is what the whole approach
 rests on and nothing else in the pipeline would notice if it were wrong by a
 factor of two; a ratio near 1.0 means the two sensors agree.
 
+`cloud.pc2` is everything a `sensor_msgs/PointCloud2` needs that is not in the
+bytes: field names, offsets, `point_step`, `is_dense`, endianness. It describes
+the cloud *after* the robot has dequantised it to float32 metres, since
+PointCloud2 has no 16-bit-with-an-origin encoding. It is on the wire so that the
+robot does not have to hardcode a layout that could then survive a change at this
+end and be read as garbage at the other.
+
+## The map loop
+
+The right-hand column of the system diagram. Three things the robot has and the
+server does not — its **pose**, its **occupancy grid** and its **exit
+candidates** — go up the same socket the frames do, and three things the server
+has and the robot does not come back.
+
+```text
+  robot                                     server
+  ─────                                     ──────
+  cam, lidar ─────── frame, scan ─────────▶  deep3r ──▶ point cloud (PointCloud2)
+  SLAM ───────────── odom, map ───────────▶    │              │
+    ▲     │                                    └──▶ compare ◀─┘
+    ┊     ▼                                            │
+    ┊   2D occupancy grid  ◀──── map_update ───────────┤
+    └┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈  ◀──── pose_hint ────────────┘   (advisory)
+        Exit? ──────────── exits ─────────▶  ranking ──▶ exits_result
+
+  ── t2 ──
+  Nav ─▶ Seek BT       ◀──────── found ─────  decision stage
+```
+
+**What it is for.** The robot's grid comes from an LDS-02: one horizontal plane,
+at the height the scanner is bolted at. It cannot see a table top, a shelf edge,
+a windowsill, or the tray of a trolley — and a robot with a camera mast collides
+with all of them. The reconstruction sees the whole volume in front of the
+camera. So the disagreement worth reporting is almost entirely one-directional:
+*the cloud has surfaces in cells the scan says are free, at heights the scan
+never visited.*
+
+**The frame is the thing to get right.** A pose in `odom` is dead reckoning; a
+pose in `map` is that plus SLAM's accumulated correction, and the grid is drawn
+in the second. They differ by a metre after a few minutes on carpet. The server
+**refuses** to compare across them rather than absorbing the mismatch, because a
+silent mismatch produces a map that looks plausible and is wrong. On this robot
+that means `--odom-topic /amcl_pose` (or your localiser's), not `/odom`.
+
+**Updates only ever add.** `map_update` carries `merge: max`, meaning a patch may
+raise a cell's occupancy and fill in an unknown one but may never lower an
+observed cell. That asymmetry is what makes the server safe to be wrong: its
+evidence is a monocular reconstruction, and when that errs it *invents* a
+surface. An invented obstacle costs a detour; the opposite policy would let a
+missing surface clear a wall the scanner saw, and that costs a collision.
+
+**`agreement` is the health number.** It is the share of cloud-occupied cells
+that the map also calls occupied, and it is the first thing to read in
+`data.compare`. A correct placement in a mapped room is well above chance. A
+wrong camera height, a wrong mount, a pose in the wrong frame and a broken
+transform all drive it towards zero, and none of them announce themselves any
+other way.
+
+**`pose_hint` is dotted in the diagram and advisory in the protocol.** It offers
+SLAM the translation that would bring the reconstruction into agreement with the
+grid. It searches translation only, at one-cell resolution, and declines when the
+best offset is not clearly better than staying put — a corridor scores almost
+identically at every offset along the wall, and the argmax there is noise. SLAM
+has a pose graph and this has a histogram, so nothing obliges SLAM to take it.
+Off by default (`compare.send_hints`); switch it on once `agreement` is healthy.
+
+Run it:
+
+```bash
+# server: the comparison runs and is logged, but writes nothing to the robot
+./scripts/run_deep3r.sh --no-map-updates
+
+# server: the full loop
+./scripts/run_deep3r.sh
+
+# robot
+python3 robocam_client.py --lidar auto --imu auto --odom auto --map auto
+```
+
+The obstacles reach a costmap only if something merges them. The standalone
+client decodes a `map_update` and reports it; a robot that wants it applied
+imports the client and passes `on_map_update=`, then calls `merge_map_patch`
+against the map it owns. That is deliberate — this file does not know whether the
+robot's map lives in a ROS node, a Nav2 layer or a file, and a client that
+guessed would be writing to a map it does not own.
+
+### The two phases
+
+`t1` explores: `compare` is live and the exits are ranked. `t2` seeks: the robot
+navigates its own map while the decision stage watches the same frames for the
+mission target and announces `found` with two poses — where the target *is*, and
+where to stand to act on it. They differ by the robot's reach, and a behaviour
+tree handed only the first has to invent the second from a standoff distance it
+has no way to know. `found: false` is a real message: the decision stage having
+looked and concluded the target is not here is what lets the robot pick another
+exit instead of seeking until it times out.
+
+Either end may change phase; the receiver echoes it back with `accepted`, which
+is what stops the two spending a minute in different phases after a lost message.
+
+**Not yet implemented:** the decision stage itself. The `found` message, its
+plumbing and the phase machine are in place and tested — a processor emits one
+with `frame.announce(wire.found(...))` and the server does the rest — but nothing
+in this repo yet decides *whether* the target is in view. That is the next piece.
+
 ### Serving it
 
 The job that serves the robot can run on **any** node with a free GPU:
@@ -656,7 +863,8 @@ TITAN RTX** (sm_75, Turing, no bf16) — see
 This used to read "the job has to be allocated on `-w nipg36`", on the grounds
 that nipg36 is the only node with a `10.128.17.x` address and that this was the
 robot's network. Both halves were wrong: the robot is on lab WiFi at
-`192.168.1.240`, and `10.128.17.196` is routed from nipg1 anyway (0.7 ms, via
+`192.168.0.240` or `192.168.1.240` (whichever of the two lab routers it joined),
+and `10.128.17.196` is routed from nipg1 anyway (0.7 ms, via
 `157.181.160.254`). The real constraint was only ever that the robot must reach
 *something* by SSH, and nipg1 serves that better — it is where the control
 tunnel already lands, and having no GPU it cannot quietly become the compute
@@ -698,13 +906,21 @@ robocam/                 server package
   pipeline.py            FrameQueue (drop-on-full) and WorkerPool
   decode.py              JPEG / raw / H.264 → numpy, per session
   config.py              YAML → validated dataclasses
+  lidar.py               scan decoding, clearance, projection into the image
+  imu.py                 burst decoding, attitude, still/moving
+  odometry.py            pose decoding, and the frame check the map loop rests on
+  occupancy.py           the 2D grid: decoding, patching, world <-> cell
+  compare.py             the Compare box: cloud vs. grid -> patch and pose hint
+  mission.py             exits, their ranking, the phase machine, approach poses
   snapshot.py            periodic frame dumps, off the IO thread
   waker.py               lets workers interrupt poll() — see below
   processors/
     base.py              Processor interface and Frame
     stats.py             default: geometry, rate, brightness
     noop.py              transport-ceiling benchmark
-    deep3r.py            CUT3R streaming reconstruction -> point cloud
+    fusion.py            stats plus the scan projected into the camera's view
+    deep3r.py            CUT3R streaming reconstruction -> point cloud, and the
+                         comparison against the robot's uploaded grid
 link/                    everything crossing the robot <-> cluster boundary
   robocam_client.py      standalone data path, deploy to the Orin
   robot                  ros2 over the reverse tunnel, run from nipg1
@@ -713,13 +929,14 @@ link/                    everything crossing the robot <-> cluster boundary
   mecanumbot-tunnel.service       reverse tunnel: robot:22 -> nipg1:8200
   mecanumbot-deep3r-tunnel.service forward tunnel: robot:5555 -> nipg1:5555
   netcheck.sh            can the robot reach the server?
+  robot-addr.sh          which of the two lab subnets the robot is on today
 config/server.yaml
 scripts/                 setup_server.sh, run_server.sh, run_deep3r.sh
   run_deep3r_bridged.sh  cluster-side half of the data path: server + the
                          reverse tunnel to the rendezvous on nipg1
 .venv/                   server only (numpy 2.x)
 .venv-cut3r/             server + torch + CUT3R (numpy 1.26.4)
-tests/                   200 tests, including real sockets end to end
+tests/                   300 tests, including real sockets end to end
 ```
 
 `waker.py` earns its place: without it a finished result waits for the current
@@ -739,10 +956,27 @@ quantisation, and the state machine that decides when a map ends — is plain
 numpy, and that is where a bug corrupts a map quietly. Keeping it testable
 without weights is what lets it be checked on a laptop.
 
+The map loop is testable on the same terms and for the same reason. Its failures
+are all quiet ones — a convention flip that mirrors a cloud, a merge rule that
+clears a wall, a patch applied to a map that no longer exists — and none of them
+need a GPU to provoke:
+
+- `test_compare.py` builds a room the scanner mapped with a table top in it that
+  a horizontal scanner could not see, and checks the table comes back as a patch.
+  The transform tests are the ones to read first: a point 2 m down the optical
+  axis has to land 2 m in front of the robot, and optical-left has to become
+  robot-left.
+- `test_occupancy.py` is mostly the merge rule, because that is the one place
+  where being wrong is unsafe rather than merely wrong.
+- `test_loopback.py` drives the new messages over real sockets, including the
+  unsolicited path — with a stub processor rather than deep3r, since what is
+  under test there is the server's sequence numbers, switches and `map_id`
+  checks, none of which involve a model.
+
 `tests/test_config.py::test_missing_file` used to be noted here as a known
 failure — it expects `FileNotFoundError` for `/nonexistent/server.yaml` and got
-`PermissionError`. That was specific to nipg36's container filesystem. On nipg1
-the whole suite is green: **195 passed, 5 skipped** (2026-09-01), the skips being
+`PermissionError`. That was specific to nipg36's container filesystem. Elsewhere
+the whole suite is green: **298 passed, 5 skipped** (2026-09-07), the skips being
 `test_deep3r_gpu.py`, which needs torch and so only runs in `.venv-cut3r`.
 
 `tests/test_loopback.py` runs a real server on a real TCP socket and talks to it

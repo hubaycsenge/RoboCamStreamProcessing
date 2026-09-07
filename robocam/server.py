@@ -8,16 +8,30 @@ ZeroMQ sockets are not thread-safe, so results travel from the workers to the
 IO thread through a plain ``queue.Queue`` which the IO loop drains after every
 poll.  That keeps all socket calls on one thread without any locking.
 
-The two non-camera sensors are the exception to "the IO thread does nothing
-slow", and only because the work is genuinely tiny: parsing 360 uint16s and
-reducing them to sector minima is ~60 µs against a 20 ms poll, and an inertial
-burst is a handful of numpy passes over a few dozen rows.  Both are answered
-inline so that obstacle and attitude information is never stuck behind a model
-in the frame queue — at 5 Hz, queueing a scan behind two 30 ms frames would be
-most of its useful life.  The last scan and the last burst are also held on the
+The non-camera streams are the exception to "the IO thread does nothing slow",
+and only because the work is genuinely tiny: parsing 360 uint16s and reducing
+them to sector minima is ~60 µs against a 20 ms poll, an inertial burst is a
+handful of numpy passes over a few dozen rows, and a pose is three floats.  All
+are answered inline so that obstacle and attitude information is never stuck
+behind a model in the frame queue — at 5 Hz, queueing a scan behind two 30 ms
+frames would be most of its useful life.  The latest of each is also held on the
 session and attached to the next frame, which is where fusion happens:
 association by arrival time on the server's own clock, rather than by unrelated
 client clocks.
+
+The occupancy grid is the one stream that breaks that pattern, because it is the
+one that is not perishable.  A grid arrives every few seconds, is decompressed
+(a few ms for a real room, which is why the size limit is checked before the
+allocation rather than after), and is then held for as long as the robot does not
+replace it.  Its age is reported but does not disqualify it: a room does not
+change in ten seconds, whereas the robot's pose in it does.
+
+Three of the server's messages are not replies at all.  ``map_update``,
+``pose_hint`` and ``found`` are produced by a processor — the Compare and
+decision boxes of the system diagram — and travel back attached to whichever
+frame they came out of; ``_send_result`` sends them first, stamping the
+per-session sequence numbers that a worker thread has no business allocating,
+and dropping any whose ``map_id`` no longer matches the map the robot is on.
 """
 
 from __future__ import annotations
@@ -38,6 +52,9 @@ import zmq
 
 from . import imu as imu_mod
 from . import lidar as lidar_mod
+from . import mission as mission_mod
+from . import occupancy as occupancy_mod
+from . import odometry as odom_mod
 from . import processors, wire
 from .config import Config
 from .decode import DecodeError, SessionDecoder
@@ -106,6 +123,49 @@ class Session:
     last_imu: Optional[imu_mod.ImuBatch] = None
     last_imu_ns: int = 0
 
+    # -- odometry ---------------------------------------------------------
+    odom_info: Dict[str, Any] = field(default_factory=dict)
+    odom_received: int = 0
+    odom_failed: int = 0
+    last_odom: Optional[odom_mod.Odom] = None
+    last_odom_ns: int = 0
+    # The pose before that one.  Kept because "how far has the robot moved
+    # since the last pose" is the number that says whether a frame gave the
+    # reconstruction any new parallax, and it cannot be recovered afterwards.
+    prev_odom: Optional[odom_mod.Odom] = None
+
+    # -- occupancy grid ---------------------------------------------------
+    map_info: Dict[str, Any] = field(default_factory=dict)
+    maps_received: int = 0
+    maps_failed: int = 0
+    # The robot's map as this server currently understands it: the last full
+    # grid, with every patch since applied.  One grid per session, shared by
+    # every frame in flight, so nothing downstream may write to it in place.
+    grid: Optional[occupancy_mod.Grid] = None
+    grid_ns: int = 0
+
+    # -- exits, phase, mission --------------------------------------------
+    exits: List[Dict[str, Any]] = field(default_factory=list)
+    exits_ns: int = 0
+    exits_received: int = 0
+    phase: str = wire.PHASE_EXPLORE
+    mission: Dict[str, Any] = field(default_factory=dict)
+
+    # -- the server's own outgoing streams --------------------------------
+    # Sequence numbers for the three announcements.  Per session and owned
+    # here, so that two workers cannot allocate the same one.
+    map_update_seq: int = 0
+    pose_hint_seq: int = 0
+    found_seq: int = 0
+    # When each was last sent, for the rate limits in config.  A costmap that
+    # is rewritten at the reconstruction's rate costs the robot more than the
+    # updates are worth.
+    last_map_update_ns: int = 0
+    last_pose_hint_ns: int = 0
+    map_updates_sent: int = 0
+    pose_hints_sent: int = 0
+    founds_sent: int = 0
+
     def touch(self) -> None:
         self.last_seen_ns = wire.monotonic_ns()
 
@@ -129,6 +189,25 @@ class Session:
         if stale_after_ms > 0 and age_ms > stale_after_ms:
             return None, age_ms
         return self.last_imu, age_ms
+
+    def fresh_odom(self, stale_after_ms: float) -> Tuple[Optional[odom_mod.Odom], float]:
+        """The last pose and its age, or (None, 0) if there is none or it is stale.
+
+        Stale means genuinely unusable rather than merely old: a pose is what
+        places a cloud in the map, and placing it with a pose from 400 ms and
+        half a metre ago puts a table through a wall.
+        """
+        if self.last_odom is None:
+            return None, 0.0
+        age_ms = (wire.monotonic_ns() - self.last_odom_ns) / 1e6
+        if stale_after_ms > 0 and age_ms > stale_after_ms:
+            return None, age_ms
+        return self.last_odom, age_ms
+
+    def grid_age_ms(self) -> float:
+        if self.grid is None:
+            return 0.0
+        return (wire.monotonic_ns() - self.grid_ns) / 1e6
 
     def age_s(self) -> float:
         return (wire.monotonic_ns() - self.created_ns) / 1e9
@@ -177,6 +256,8 @@ class StreamServer:
         self._stat_imu_bursts = 0
         self._stat_imu_samples = 0
         self._stat_imu_bytes = 0
+        self._stat_map_bytes = 0
+        self._stat_announcements = 0
 
     # -- lifecycle --------------------------------------------------------
 
@@ -199,9 +280,14 @@ class StreamServer:
 
         def build_processor():
             # Each worker gets its own instance; each is told where the scanner
-            # points and how the IMU is read before it sees a frame.
+            # points, how the IMU is read, and — for the stages that compare a
+            # reconstruction against the robot's map — where the camera is bolted
+            # and which height slice counts as an obstacle.  Those last describe
+            # the robot rather than the model, so they come from the server's
+            # config and not from the processor's own options, where the two
+            # could disagree.
             processor = processors.build(name, options)
-            processor.configure(self.cfg.lidar, self.cfg.imu)
+            processor.configure(self.cfg.lidar, self.cfg.imu, self.cfg)
             return processor
 
         self.pool = WorkerPool(
@@ -233,6 +319,20 @@ class StreamServer:
                 f"stale >{self.cfg.imu.stale_after_ms:.0f} ms)"
                 if self.cfg.imu.enabled else "off"
             ),
+        )
+        log.info(
+            "  odom=%s | map=%s | compare=%s | phase=%s%s",
+            "on" if self.cfg.odom.enabled else "off",
+            "on" if self.cfg.map.enabled else "off",
+            (
+                f"on (z {self.cfg.compare.z_min:.2f}-{self.cfg.compare.z_max:.2f} m, "
+                f"camera at {self.cfg.compare.camera_z:.2f} m, "
+                f"patches {'on' if self.cfg.map.send_updates else 'off'}, "
+                f"hints {'on' if self.cfg.compare.send_hints else 'off'})"
+                if self.cfg.compare.enabled else "off"
+            ),
+            self.cfg.mission.phase,
+            f" | target={self.cfg.mission.target!r}" if self.cfg.mission.target else "",
         )
         # These are addresses on *this* node, for a benchmark client running
         # here. They are deliberately not labelled as somewhere the robot can
@@ -340,6 +440,14 @@ class StreamServer:
             self._on_scan(session, header, payload, recv_ts_ns)
         elif msg_type == wire.MSG_IMU:
             self._on_imu(session, header, payload, recv_ts_ns)
+        elif msg_type == wire.MSG_ODOM:
+            self._on_odom(session, header, recv_ts_ns)
+        elif msg_type == wire.MSG_MAP:
+            self._on_map(session, header, payload, recv_ts_ns)
+        elif msg_type == wire.MSG_EXITS:
+            self._on_exits(session, header, recv_ts_ns)
+        elif msg_type == wire.MSG_PHASE:
+            self._on_phase(session, header)
         elif msg_type == wire.MSG_PING:
             self._send(identity, wire.pong(header.get("nonce", 0), header.get("t_send_ns")))
         elif msg_type == wire.MSG_BYE:
@@ -354,8 +462,15 @@ class StreamServer:
         session = self._create_session(identity, header)
         session.greeted = True
 
-        if peer_protocol != wire.PROTOCOL_VERSION:
-            msg = f"client protocol {peer_protocol} != server protocol {wire.PROTOCOL_VERSION}"
+        # A range rather than equality: everything added in v2 is additive, so a
+        # v1 client is a client that simply never sends a map and never hears a
+        # map_update.  What must still be refused is a version this server has
+        # never heard of, which may mean something different by a field name it
+        # thinks it recognises.
+        if (not isinstance(peer_protocol, int)
+                or not wire.MIN_PROTOCOL_VERSION <= peer_protocol <= wire.PROTOCOL_VERSION):
+            msg = (f"client protocol {peer_protocol} is outside the supported range "
+                   f"{wire.MIN_PROTOCOL_VERSION}..{wire.PROTOCOL_VERSION}")
             log.warning("session %s: %s", session.session_id, msg)
             self._send(
                 identity,
@@ -369,6 +484,14 @@ class StreamServer:
             )
             self._drop_session(identity)
             return
+
+        if peer_protocol != wire.PROTOCOL_VERSION:
+            log.info(
+                "session %s speaks protocol %d; this server is %d. The difference is "
+                "additive (odometry, the occupancy grid, the exits and the server's "
+                "announcements), so the session runs — without them.",
+                session.session_id, peer_protocol, wire.PROTOCOL_VERSION,
+            )
 
         codec = header.get("codec", wire.CODEC_JPEG)
         if codec not in wire.SUPPORTED_CODECS:
@@ -430,6 +553,37 @@ class StreamServer:
                         "fields": list(wire.IMU_FIELDS),
                         "stale_after_ms": self.cfg.imu.stale_after_ms,
                     },
+                    # And for the two streams the robot's own software produces.
+                    "odom": {
+                        "enabled": self.cfg.odom.enabled,
+                        "expect_frame": self.cfg.odom.expect_frame,
+                        "stale_after_ms": self.cfg.odom.stale_after_ms,
+                    },
+                    "map": {
+                        "enabled": self.cfg.map.enabled,
+                        "encodings": list(wire.SUPPORTED_MAP_ENCODINGS),
+                        "max_cells": self.cfg.map.max_cells,
+                        # The robot needs all three before it can decide whether
+                        # to spend the CPU serialising a grid every few seconds:
+                        # a server that will not compare, or will compare but not
+                        # send the result, is one there is no point uploading to.
+                        "send_updates": self.cfg.map.send_updates and self.cfg.compare.enabled,
+                        "merge": self.cfg.map.merge,
+                    },
+                    # What the robot must know to act on a pose_hint or a found:
+                    # that they are coming at all, and which phase this server
+                    # believes the session is in.
+                    "compare": {
+                        "enabled": self.cfg.compare.enabled,
+                        "send_hints": self.cfg.compare.send_hints,
+                        "z_slice": [self.cfg.compare.z_min, self.cfg.compare.z_max],
+                    },
+                    "mission": {
+                        "phase": session.phase,
+                        "target": session.mission.get("target", ""),
+                        "rank_exits": self.cfg.mission.rank_exits,
+                        "phases": list(wire.SUPPORTED_PHASES),
+                    },
                 },
                 echo_t_send_ns=header.get("t_send_ns"),
             ),
@@ -450,7 +604,23 @@ class StreamServer:
             camera=str(header.get("camera", "")),
             lidar_info=dict(header.get("lidar") or {}),
             imu_info=dict(header.get("imu") or {}),
+            odom_info=dict(header.get("odom") or {}),
+            map_info=dict(header.get("map") or {}),
         )
+        # The phase and the mission belong to the run, so the robot's hello wins
+        # over the config; the config supplies the default for a client that has
+        # no opinion, which is every v1 client.
+        try:
+            session.phase = mission_mod.check_phase(header.get("phase"))
+        except mission_mod.MissionError:
+            session.phase = self.cfg.mission.phase
+        try:
+            session.mission = mission_mod.normalise_mission(header.get("mission"))
+        except mission_mod.MissionError as exc:
+            log.warning("session %s sent an unusable mission: %s", session.session_id, exc)
+            session.mission = {}
+        if not session.mission.get("target") and self.cfg.mission.target:
+            session.mission["target"] = self.cfg.mission.target
         self.sessions[identity] = session
         return session
 
@@ -460,7 +630,9 @@ class StreamServer:
             session.decoder.close()
             log.info(
                 "session %s closed | %d frames, %d dropped, %d failed, "
-                "%d scans (%d bad), %d imu samples (%d bad bursts), %.1f MB, %.0fs",
+                "%d scans (%d bad), %d imu samples (%d bad bursts), "
+                "%d poses (%d bad), %d maps (%d bad), "
+                "%d patches / %d hints / %d found sent | %.1f MB, %.0fs",
                 session.session_id,
                 session.frames_received,
                 session.frames_dropped,
@@ -469,6 +641,13 @@ class StreamServer:
                 session.scans_failed,
                 session.imu_samples_received,
                 session.imu_failed,
+                session.odom_received,
+                session.odom_failed,
+                session.maps_received,
+                session.maps_failed,
+                session.map_updates_sent,
+                session.pose_hints_sent,
+                session.founds_sent,
                 session.bytes_received / 1e6,
                 session.age_s(),
             )
@@ -521,6 +700,10 @@ class StreamServer:
         # instant it was taken, and a 200 ms old attitude belongs to a robot
         # that may already have finished the turn.
         burst, imu_age_ms = session.fresh_imu(self.cfg.imu.stale_after_ms)
+        # And the pose.  Tighter again than the inertial window in what it costs
+        # to be wrong: this is what decides *where* everything the model produces
+        # from this frame ends up on the robot's map.
+        pose, odom_age_ms = session.fresh_odom(self.cfg.odom.stale_after_ms)
 
         self._frame_counter += 1
         self.snapshots.maybe_offer(session.session_id, seq, image, self._frame_counter,
@@ -538,6 +721,17 @@ class StreamServer:
             scan_age_ms=scan_age_ms if scan is not None else 0.0,
             imu=burst,
             imu_age_ms=imu_age_ms if burst is not None else 0.0,
+            odom=pose,
+            odom_age_ms=odom_age_ms if pose is not None else 0.0,
+            # The grid is handed over by reference and shared by every frame in
+            # flight; see Frame.grid for why nothing may write to it in place.
+            # No staleness cutoff: a map that is ten seconds old still describes
+            # the room, which is the whole difference between it and a scan.
+            grid=session.grid,
+            grid_age_ms=session.grid_age_ms(),
+            exits=list(session.exits),
+            phase=session.phase,
+            mission=dict(session.mission),
         )
         for evicted in self.frames.put(frame):
             session.frames_dropped += 1
@@ -696,6 +890,312 @@ class StreamServer:
             t_send_ns=header.get("t_send_ns"),
         ))
 
+    # -- odometry path ----------------------------------------------------
+
+    def _on_odom(self, session: Session, header: Dict[str, Any], recv_ts_ns: int) -> None:
+        """Parse and answer one pose.  No payload; the header is the message.
+
+        The reply is thin because there is nothing to say about a single pose.
+        What it does carry is the one thing the robot cannot determine from its
+        own side: whether the server can actually use this pose — whether it is
+        in the frame the uploaded grid is drawn in, and whether there is a grid
+        at all.  "The server is not comparing anything" and "the server is
+        comparing and finding nothing" are otherwise the same silence.
+        """
+        seq = int(header.get("seq", -1))
+        cfg = self.cfg.odom
+
+        if not cfg.enabled:
+            self._send(session.identity, wire.odom_result(
+                seq=seq, ok=False, reason=wire.REASON_ODOM_DISABLED,
+                server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+                data={"error": "server has odom.enabled: false"},
+                t_capture_ns=header.get("t_capture_ns"),
+                t_send_ns=header.get("t_send_ns"),
+            ))
+            return
+
+        session.odom_received += 1
+        try:
+            pose = odom_mod.decode_odom(header, recv_ts_ns=recv_ts_ns)
+        except odom_mod.OdomError as exc:
+            session.odom_failed += 1
+            log.warning("session %s: odom seq=%d rejected: %s", session.session_id, seq, exc)
+            self._send(session.identity, wire.odom_result(
+                seq=seq, ok=False, reason=wire.REASON_BAD_ODOM,
+                server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+                data={"error": str(exc)},
+                t_capture_ns=header.get("t_capture_ns"),
+                t_send_ns=header.get("t_send_ns"),
+            ))
+            return
+
+        pose.summary = odom_mod.analyse(
+            pose, previous=session.last_odom,
+            still_speed_ms=cfg.still_speed_ms,
+            still_yaw_rate_dps=cfg.still_yaw_rate_dps,
+        )
+        session.prev_odom = session.last_odom
+        session.last_odom = pose
+        session.last_odom_ns = recv_ts_ns
+
+        data = dict(pose.summary)
+        # The three preconditions for the comparison, reported rather than
+        # implied.  A robot sending poses in "odom" against a grid in "map" gets
+        # told so on every pose instead of discovering it as a map that never
+        # improves.
+        frame_ok = (not cfg.expect_frame) or pose.frame == cfg.expect_frame
+        data["usable_for_compare"] = bool(
+            self.cfg.compare.enabled and frame_ok and session.grid is not None
+            and (session.grid is None or session.grid.frame == pose.frame)
+        )
+        if not frame_ok:
+            data["frame_warning"] = (
+                f"pose is in {pose.frame!r} but the server expects "
+                f"{cfg.expect_frame!r}; dead reckoning cannot be compared "
+                "against a SLAM grid"
+            )
+        elif session.grid is None:
+            data["frame_warning"] = "no occupancy grid uploaded yet, nothing to compare against"
+        elif session.grid.frame != pose.frame:
+            data["frame_warning"] = (
+                f"pose is in {pose.frame!r}, grid is in {session.grid.frame!r}"
+            )
+
+        self._send(session.identity, wire.odom_result(
+            seq=seq, ok=True, reason=wire.REASON_OK,
+            server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+            data=data,
+            t_capture_ns=header.get("t_capture_ns"),
+            t_send_ns=header.get("t_send_ns"),
+        ))
+
+    # -- occupancy grid path ----------------------------------------------
+
+    def _on_map(self, session: Session, header: Dict[str, Any], payload: bytes,
+                recv_ts_ns: int) -> None:
+        """Parse and store one occupancy grid, or apply one patch of one.
+
+        This is the only inline path that is not tiny — a 400x400 grid is 160 kB
+        to decompress — and it is inline anyway because it happens every few
+        seconds rather than every frame.  Queueing it behind the model would buy
+        nothing and would mean a map arriving after the frames it should have
+        been compared against.
+        """
+        seq = int(header.get("seq", -1))
+        cfg = self.cfg.map
+
+        if not cfg.enabled:
+            self._send(session.identity, wire.map_result(
+                seq=seq, ok=False, reason=wire.REASON_MAP_DISABLED,
+                payload_bytes=len(payload),
+                encoding=str(header.get("encoding", "")),
+                server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+                data={"error": "server has map.enabled: false"},
+                t_capture_ns=header.get("t_capture_ns"),
+                t_send_ns=header.get("t_send_ns"),
+            ))
+            return
+
+        session.maps_received += 1
+        session.bytes_received += len(payload)
+        self._stat_map_bytes += len(payload)
+
+        t0 = time.perf_counter()
+        try:
+            grid = occupancy_mod.decode_map(
+                header, payload, recv_ts_ns=recv_ts_ns, max_cells=cfg.max_cells,
+            )
+        except occupancy_mod.MapError as exc:
+            session.maps_failed += 1
+            reason = (wire.REASON_MAP_TOO_LARGE if "cell limit" in str(exc)
+                      else wire.REASON_BAD_MAP)
+            log.warning("session %s: map seq=%d rejected: %s", session.session_id, seq, exc)
+            self._send(session.identity, wire.map_result(
+                seq=seq, ok=False, reason=reason,
+                payload_bytes=len(payload),
+                encoding=str(header.get("encoding", "")),
+                parse_ms=(time.perf_counter() - t0) * 1000.0,
+                server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+                data={"error": str(exc)},
+                t_capture_ns=header.get("t_capture_ns"),
+                t_send_ns=header.get("t_send_ns"),
+            ))
+            return
+
+        applied = 0
+        if grid.full:
+            session.grid = grid
+        elif session.grid is None:
+            # A patch with nothing to patch.  Refused rather than promoted to a
+            # full grid: its x0/y0 place it inside a map this server has never
+            # seen, and treating the window as the whole map would put every
+            # later comparison at an offset nothing would ever detect.
+            session.maps_failed += 1
+            self._send(session.identity, wire.map_result(
+                seq=seq, ok=False, reason=wire.REASON_BAD_MAP,
+                payload_bytes=len(payload),
+                encoding=str(header.get("encoding", "")),
+                parse_ms=(time.perf_counter() - t0) * 1000.0,
+                server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+                data={"error": "patch received before any full grid; send full: true first"},
+                t_capture_ns=header.get("t_capture_ns"),
+                t_send_ns=header.get("t_send_ns"),
+            ))
+            return
+        elif session.grid.map_id != grid.map_id:
+            session.maps_failed += 1
+            self._send(session.identity, wire.map_result(
+                seq=seq, ok=False, reason=wire.REASON_BAD_MAP,
+                payload_bytes=len(payload),
+                encoding=str(header.get("encoding", "")),
+                parse_ms=(time.perf_counter() - t0) * 1000.0,
+                server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+                data={"error": (f"patch is for map_id {grid.map_id!r}, the server holds "
+                                f"{session.grid.map_id!r}; send the full grid after a reset")},
+                t_capture_ns=header.get("t_capture_ns"),
+                t_send_ns=header.get("t_send_ns"),
+            ))
+            return
+        else:
+            # The robot's own patches replace: they are its map, not an opinion
+            # about it, and it may legitimately clear a cell it has re-observed.
+            applied = occupancy_mod.apply_patch(
+                session.grid, grid, merge=wire.MAP_MERGE_REPLACE,
+            )
+            session.grid.seq = grid.seq
+
+        session.grid_ns = recv_ts_ns
+        parse_ms = (time.perf_counter() - t0) * 1000.0
+
+        held = session.grid
+        held.summary = occupancy_mod.analyse(held)
+        data = dict(held.summary)
+        data["parse_ms"] = round(parse_ms, 2)
+        if not grid.full:
+            data["patch_applied_cells"] = applied
+        pose, _ = session.fresh_odom(self.cfg.odom.stale_after_ms)
+        data["compare_ready"] = bool(
+            self.cfg.compare.enabled and pose is not None and pose.frame == held.frame
+        )
+        if not data["compare_ready"]:
+            data["compare_blocked_by"] = (
+                "compare.enabled is false" if not self.cfg.compare.enabled
+                else "no fresh pose" if pose is None
+                else f"pose is in {pose.frame!r}, grid is in {held.frame!r}"
+            )
+
+        log.info(
+            "session %s: map seq=%d %dx%d @%.3f m/cell, %.0f%% explored, "
+            "%d occupied (%.1f kB on the wire, %.1f ms)",
+            session.session_id, seq, held.width, held.height, held.resolution,
+            100.0 * held.summary.get("explored_fraction", 0.0),
+            held.summary.get("occupied", 0), len(payload) / 1000.0, parse_ms,
+        )
+
+        self._send(session.identity, wire.map_result(
+            seq=seq, ok=True, reason=wire.REASON_OK,
+            cells=held.size,
+            payload_bytes=len(payload),
+            encoding=str(header.get("encoding", "")),
+            parse_ms=parse_ms,
+            server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+            data=data,
+            t_capture_ns=header.get("t_capture_ns"),
+            t_send_ns=header.get("t_send_ns"),
+        ))
+
+    # -- exits path -------------------------------------------------------
+
+    def _on_exits(self, session: Session, header: Dict[str, Any], recv_ts_ns: int) -> None:
+        """Validate the robot's exit candidates and answer with a ranking."""
+        seq = int(header.get("seq", -1))
+        try:
+            candidates = mission_mod.decode_exits(header)
+        except mission_mod.MissionError as exc:
+            log.warning("session %s: exits seq=%d rejected: %s", session.session_id, seq, exc)
+            self._send(session.identity, wire.exits_result(
+                seq=seq, ok=False, reason=wire.REASON_BAD_EXITS,
+                server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+                data={"error": str(exc)},
+                t_capture_ns=header.get("t_capture_ns"),
+                t_send_ns=header.get("t_send_ns"),
+            ))
+            return
+
+        session.exits = candidates
+        session.exits_ns = recv_ts_ns
+        session.exits_received += 1
+
+        if not self.cfg.mission.rank_exits:
+            self._send(session.identity, wire.exits_result(
+                seq=seq, ok=True, reason=wire.REASON_OK,
+                server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+                data={"received": len(candidates), "ranked": False,
+                      "note": "server has mission.rank_exits: false"},
+                t_capture_ns=header.get("t_capture_ns"),
+                t_send_ns=header.get("t_send_ns"),
+            ))
+            return
+
+        pose, _ = session.fresh_odom(self.cfg.odom.stale_after_ms)
+        ranked, chosen, method = mission_mod.rank_exits(
+            candidates, pose,
+            min_width_m=self.cfg.mission.min_exit_width_m,
+            turn_cost_m_per_rad=self.cfg.mission.turn_cost_m_per_rad,
+        )
+        self._send(session.identity, wire.exits_result(
+            seq=seq, ok=True, reason=wire.REASON_OK,
+            ranked=ranked, chosen=chosen,
+            server_ms=(wire.monotonic_ns() - recv_ts_ns) / 1e6,
+            data={"received": len(candidates), "method": method,
+                  "phase": session.phase,
+                  # Without a pose the ranking cannot measure distance and falls
+                  # back to the robot's own priors; saying so beats returning an
+                  # order that looks considered and is not.
+                  "had_pose": pose is not None},
+            t_capture_ns=header.get("t_capture_ns"),
+            t_send_ns=header.get("t_send_ns"),
+        ))
+
+    # -- phase path -------------------------------------------------------
+
+    def _on_phase(self, session: Session, header: Dict[str, Any]) -> None:
+        """Move the session between t1 and t2, and say so back.
+
+        Answered with the same message type and ``accepted`` set, which is what
+        keeps the two ends from spending a minute in different phases after one
+        lost message.  A rejected phase leaves the session where it was.
+        """
+        try:
+            name = mission_mod.check_phase(header.get("phase"))
+        except mission_mod.MissionError as exc:
+            log.warning("session %s: %s", session.session_id, exc)
+            self._send(session.identity, wire.phase(
+                session.phase, reason=str(exc), accepted=False,
+            ))
+            return
+
+        if "mission" in header:
+            try:
+                updated = mission_mod.normalise_mission(header.get("mission"))
+            except mission_mod.MissionError as exc:
+                log.warning("session %s sent an unusable mission: %s", session.session_id, exc)
+            else:
+                session.mission.update(updated)
+
+        previous, session.phase = session.phase, name
+        if previous != name:
+            log.info("session %s: phase %s -> %s (%s)%s",
+                     session.session_id, previous, name,
+                     header.get("reason", "no reason given"),
+                     f" target={session.mission['target']!r}"
+                     if session.mission.get("target") else "")
+        self._send(session.identity, wire.phase(
+            name, reason=str(header.get("reason", "")),
+            mission=session.mission, accepted=True,
+        ))
+
     # -- send path --------------------------------------------------------
 
     def _flush_results(self) -> None:
@@ -713,6 +1213,11 @@ class StreamServer:
             # Client disconnected while its frame was in flight.
             return
         session.frames_processed += 1
+
+        # The processor's own products go first, so a robot acting on the result
+        # already holds whatever they carried.
+        if item.announcements:
+            self._send_announcements(session, item)
 
         frame = item.frame
         img = frame.image
@@ -742,8 +1247,101 @@ class StreamServer:
             scan_age_ms=frame.scan_age_ms if frame.scan is not None else None,
             imu_seq=frame.imu.seq if frame.imu is not None else None,
             imu_age_ms=frame.imu_age_ms if frame.imu is not None else None,
+            odom_seq=frame.odom.seq if frame.odom is not None else None,
+            odom_age_ms=frame.odom_age_ms if frame.odom is not None else None,
+            map_seq=frame.grid.seq if frame.grid is not None else None,
+            map_id=frame.grid.map_id if frame.grid is not None else None,
         )
         self._send(session.identity, header)
+
+    def _send_announcements(self, session: Session, item: ProcessedResult) -> None:
+        """Send the unsolicited messages one frame produced.
+
+        Everything a worker cannot decide happens here, on the one thread that
+        holds the session:
+
+        * **Sequence numbers.** Per session, per stream, allocated here so two
+          workers cannot allocate the same one.
+        * **The operator's switches.** ``map.send_updates`` and
+          ``compare.send_hints`` gate what leaves the server, independently of
+          what the processor computed.  That split is deliberate: it lets you run
+          the comparison and read what it *would* have sent, in the logs, without
+          letting it write to the robot's costmap.
+        * **Rate limits.** The reconstruction produces several clouds a second;
+          the robot's costmap does not need rewriting at that rate, and a pose
+          correction the robot has not had time to apply will only be measured
+          again.
+        * **Staleness of the map identity.** A patch whose ``map_id`` no longer
+          matches the grid the robot is on describes coordinates in a map that no
+          longer exists.  Dropping it here is cheap; applying it on the robot
+          would corrupt the new map in a way nothing downstream could detect.
+        """
+        now = wire.monotonic_ns()
+        current_map_id = session.grid.map_id if session.grid is not None else None
+
+        for header, payload in item.announcements:
+            mtype = header.get("type")
+
+            if mtype == wire.MSG_MAP_UPDATE:
+                if not (self.cfg.map.send_updates and self.cfg.compare.enabled):
+                    log.debug("session %s: map_update suppressed by config", session.session_id)
+                    continue
+                if current_map_id is not None and header.get("map_id") != current_map_id:
+                    log.info("session %s: dropping map_update for map_id %r; robot is on %r",
+                             session.session_id, header.get("map_id"), current_map_id)
+                    continue
+                interval_ms = (now - session.last_map_update_ns) / 1e6
+                if (session.last_map_update_ns
+                        and interval_ms < self.cfg.map.min_update_interval_ms):
+                    continue
+                if int(header.get("cells_changed", 0)) < self.cfg.map.min_update_cells:
+                    continue
+                header["seq"] = session.map_update_seq
+                header.setdefault("merge", self.cfg.map.merge)
+                session.map_update_seq += 1
+                session.last_map_update_ns = now
+                session.map_updates_sent += 1
+
+            elif mtype == wire.MSG_POSE_HINT:
+                if not (self.cfg.compare.enabled and self.cfg.compare.send_hints):
+                    continue
+                if current_map_id is not None and header.get("map_id") != current_map_id:
+                    continue
+                interval_ms = (now - session.last_pose_hint_ns) / 1e6
+                if (session.last_pose_hint_ns
+                        and interval_ms < self.cfg.compare.min_hint_interval_ms):
+                    continue
+                header["seq"] = session.pose_hint_seq
+                session.pose_hint_seq += 1
+                session.last_pose_hint_ns = now
+                session.pose_hints_sent += 1
+                log.info("session %s: offering SLAM a correction of (%+.3f, %+.3f) m "
+                         "from %d inliers -- advisory, %s",
+                         session.session_id, header.get("dx", 0.0), header.get("dy", 0.0),
+                         header.get("inliers", 0), header.get("method", "?"))
+
+            elif mtype == wire.MSG_FOUND:
+                # Not rate-limited and not gated: this is the end of the mission,
+                # and a server that decided the target is in view has nothing to
+                # gain by holding the message back.  It is logged at info because
+                # it is the single most consequential thing this server sends.
+                header["seq"] = session.found_seq
+                session.found_seq += 1
+                session.founds_sent += 1
+                log.info("session %s: %s %r at (%.2f, %.2f) confidence %.2f -- %s",
+                         session.session_id,
+                         "FOUND" if header.get("found") else "did not find",
+                         header.get("target", ""), header.get("x", 0.0),
+                         header.get("y", 0.0), header.get("confidence", 0.0),
+                         header.get("rationale", "") or header.get("decider", ""))
+
+            else:
+                log.warning("session %s: processor announced unknown type %r",
+                            session.session_id, mtype)
+                continue
+
+            self._stat_announcements += 1
+            self._send(session.identity, header, payload)
 
     def _send_dropped(self, session: Session, frame: Frame) -> None:
         """Acknowledge a frame the queue evicted.
@@ -846,7 +1444,7 @@ class StreamServer:
                 # against the sensor's own rate when hunting a gap.
                 self._stat_imu_samples / elapsed,
                 self._nearest_obstacle_note(),
-                self._attitude_note(),
+                self._attitude_note() + self._map_note(),
                 mbps, avg_ms, self._stat_dropped, len(self.sessions), len(self.frames),
             )
         elif self.sessions:
@@ -862,6 +1460,29 @@ class StreamServer:
         self._stat_imu_bursts = 0
         self._stat_imu_samples = 0
         self._stat_imu_bytes = 0
+        self._stat_map_bytes = 0
+        self._stat_announcements = 0
+
+    def _map_note(self) -> str:
+        """What the server currently holds of the robot's map, and what it sent back.
+
+        Two numbers, for the two questions this half of the system raises first:
+        is there a map on the server at all (a robot that never uploads one looks
+        identical to one whose uploads are being refused), and is anything coming
+        back out of the comparison.
+        """
+        for session in self.sessions.values():
+            if session.grid is None:
+                continue
+            note = " | map %dx%d %.0f%% known" % (
+                session.grid.width, session.grid.height,
+                100.0 * session.grid.summary.get("explored_fraction", 0.0),
+            )
+            if session.map_updates_sent or session.pose_hints_sent:
+                note += " (%d patch, %d hint sent)" % (
+                    session.map_updates_sent, session.pose_hints_sent)
+            return note
+        return ""
 
     def _nearest_obstacle_note(self) -> str:
         """The closest thing any session can currently see, for the stats line.
@@ -971,6 +1592,28 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ignore scan messages (the robot is told, and stops sending)")
     p.add_argument("--no-imu", action="store_true",
                    help="ignore imu messages (the robot is told, and stops sending)")
+    p.add_argument("--no-odom", action="store_true",
+                   help="ignore odom messages. Nothing can be placed in the robot's "
+                        "map frame without them, so this also disables compare.")
+    p.add_argument("--no-map", action="store_true",
+                   help="ignore the robot's occupancy grid, and with it the comparison")
+    p.add_argument("--no-compare", action="store_true",
+                   help="receive the map but do not compare the reconstruction against "
+                        "it; useful for measuring the cost of the upload alone")
+    p.add_argument("--no-map-updates", action="store_true",
+                   help="run the comparison and log what it finds, but do not send "
+                        "patches to the robot. The way to check what the server WOULD "
+                        "write to the costmap before letting it.")
+    p.add_argument("--pose-hints", action="store_true",
+                   help="offer SLAM pose corrections (compare.send_hints). Off by "
+                        "default: switch it on once agreement has been seen healthy.")
+    p.add_argument("--camera-height", type=float, default=None,
+                   help="override compare.camera_z, metres above the floor. Wrong here "
+                        "puts every reconstructed surface at the wrong height.")
+    p.add_argument("--phase", choices=list(wire.SUPPORTED_PHASES), default=None,
+                   help="phase for sessions that do not declare one: t1 explore, t2 seek")
+    p.add_argument("--target", default=None,
+                   help="mission target for t2, for a client that does not send one")
     p.add_argument("--mount-yaw", type=float, default=None,
                    help="override lidar.mount_yaw_deg: bearing the camera looks along")
     p.add_argument("--hfov", type=float, default=None,
@@ -1003,6 +1646,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg.lidar.enabled = False
     if args.no_imu:
         cfg.imu.enabled = False
+    if args.no_odom:
+        cfg.odom.enabled = False
+        # Not a separate switch to remember: a comparison needs a pose to place
+        # the cloud with, and one that ran without would be comparing a cloud
+        # against a map it has no reason to believe overlaps.
+        cfg.compare.enabled = False
+    if args.no_map:
+        cfg.map.enabled = False
+        cfg.compare.enabled = False
+    if args.no_compare:
+        cfg.compare.enabled = False
+    if args.no_map_updates:
+        cfg.map.send_updates = False
+    if args.pose_hints:
+        cfg.compare.send_hints = True
+    if args.camera_height is not None:
+        cfg.compare.camera_z = args.camera_height
+    if args.phase:
+        cfg.mission.phase = args.phase
+    if args.target is not None:
+        cfg.mission.target = args.target
     if args.mount_yaw is not None:
         cfg.lidar.mount_yaw_deg = args.mount_yaw
     if args.hfov is not None:

@@ -8,7 +8,10 @@ Host mecanumbot robot
     ServerAliveInterval 20
     ServerAliveCountMax 3
 
-# The laptop's ad-hoc tunnel (ssh -R 8222:192.168.0.240:22) lands here instead:
+# The laptop's ad-hoc tunnel lands here instead. Open it with
+#   ssh -R 8222:"$(./robot-addr.sh)":22 csengehubay@nipg1.inf.elte.hu
+# rather than a literal address: the lab has two routers, and the robot is
+# 192.168.0.240 behind 192.168.0.1 and 192.168.1.240 behind 192.168.1.1.
 Host mecanumbot-laptop
     HostName 127.0.0.1
     Port 8222

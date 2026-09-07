@@ -161,6 +161,173 @@ class ImuConfig:
 
 
 @dataclass
+class OdomConfig:
+    """How the server treats the robot's odometry stream.
+
+    There is almost nothing to configure, and that is the point: a pose is not
+    interpreted, it is *used* — to place a reconstruction in the frame the map is
+    drawn in.  What is here is the freshness window and the one threshold that
+    decides whether the robot counts as standing still.
+    """
+
+    enabled: bool = True
+    # A pose older than this is not attached to a frame.  Between the LiDAR's
+    # window and the IMU's: odometry updates at roughly the frame rate, and a
+    # 200 ms old pose belongs to a robot that has moved ~6 cm at this robot's
+    # cruising speed -- about one map cell, which is the error budget.
+    stale_after_ms: float = 200.0
+    # Below this speed and yaw rate the robot counts as still.  Only reported,
+    # never acted on here; it is what tells a reader of the log that a frame
+    # gave the reconstruction no new parallax.
+    still_speed_ms: float = 0.02
+    still_yaw_rate_dps: float = 2.0
+    # The frame odometry is expected to arrive in.  "map" is what makes a
+    # comparison against the SLAM grid meaningful; a robot sending "odom" is
+    # sending dead reckoning, and the mismatch is refused rather than absorbed.
+    # Empty accepts whatever arrives and leaves the check to compare.py.
+    expect_frame: str = "map"
+
+    def __post_init__(self) -> None:
+        if self.stale_after_ms < 0.0:
+            raise ConfigError("odom.stale_after_ms must be >= 0")
+
+
+@dataclass
+class MapConfig:
+    """How the server treats the robot's 2D occupancy grid."""
+
+    enabled: bool = True
+    # Refuse a grid larger than this.  4 million cells is a 1 km square at 5 cm,
+    # or a 100 m square at 5 mm: past anything this robot maps, and a bound on
+    # what a corrupt width field can allocate.
+    max_cells: int = 4_000_000
+    # A grid older than this is stale for comparison purposes.  Much longer than
+    # the sensor windows because a map is not perishable in the same way: a
+    # room does not change in ten seconds, whereas the robot's pose in it does.
+    stale_after_ms: float = 10_000.0
+    # Send map_update patches back to the robot.  Turning this off leaves the
+    # comparison running and reported -- useful for checking what the server
+    # *would* send before letting it write to the robot's costmap.
+    send_updates: bool = True
+    # Smallest patch worth a message, in cells.  Below this the news is single
+    # frame reconstruction noise more often than it is furniture.
+    min_update_cells: int = 4
+    # Value written into cells the comparison newly calls occupied.  100 is
+    # "certainly occupied" in the ROS scale; lower it to let the robot's own
+    # costmap inflation treat these as weaker evidence than its scanner's.
+    occupied_value: int = 100
+    # How the robot should merge a patch: "max" (add obstacles, never clear) or
+    # "replace".  See robocam/occupancy.py for why max is the default and why
+    # replace needs a reason.
+    merge: str = "max"
+    # No more than one patch per this many milliseconds.  The reconstruction
+    # produces a cloud several times a second and the robot's costmap does not
+    # need to be rewritten at that rate; the cost of the message is small, the
+    # cost of the merge on the robot is not.
+    min_update_interval_ms: float = 500.0
+
+    def __post_init__(self) -> None:
+        if self.max_cells < 1:
+            raise ConfigError("map.max_cells must be >= 1")
+        if self.merge not in ("max", "replace"):
+            raise ConfigError(f"map.merge must be 'max' or 'replace', got {self.merge!r}")
+        if not 0 <= self.occupied_value <= 100:
+            raise ConfigError("map.occupied_value must be in [0, 100]")
+
+
+@dataclass
+class CompareConfig:
+    """The comparison of the reconstruction against the robot's grid.
+
+    The height slice and the camera mount are the two groups that describe
+    physical facts, and both are worth measuring rather than guessing: the slice
+    decides which surfaces count as obstacles, and the mount decides where the
+    cloud lands.  A wrong mount produces a comparison that runs perfectly and
+    reports agreement near zero -- which is why compare.py makes that number the
+    first one in its output.
+    """
+
+    enabled: bool = True
+
+    # --- the height slice, metres above the map's floor plane ---
+    # Above the floor, so the floor itself is not an obstacle.  5 cm is roughly
+    # the lip this robot can drive over.
+    z_min: float = 0.05
+    # Below the ceiling, and below anything the robot passes under.  1.6 m is
+    # well above the Mecanumbot with its mast; lower it if the robot is shorter
+    # than the things it is allowed to drive beneath.
+    z_max: float = 1.6
+    # Points needed in a cell before it counts as a surface.  One is a pixel of
+    # a monocular depth estimate; three in a 5 cm cell is a patch of something.
+    min_points: int = 3
+
+    # --- where the camera is bolted, in the base frame (metres, radians) ---
+    # REP-103: x forward, y left, z up.  pitch is positive nose-down.  On this
+    # robot the camera is on a neck motor, so pitch is whatever the neck is
+    # commanded to -- these defaults describe it looking level.
+    camera_x: float = 0.10
+    camera_y: float = 0.0
+    camera_z: float = 0.45
+    camera_roll: float = 0.0
+    camera_pitch: float = 0.0
+    camera_yaw: float = 0.0
+
+    # --- the pose hint ---
+    # Offer SLAM a correction when the cloud and the map agree better at an
+    # offset than at zero.  Off by default: it is an inference from a histogram
+    # against a robot that has a pose graph, and it should be switched on
+    # deliberately once agreement has been seen to be healthy.
+    send_hints: bool = False
+    # Half-width of the offset search, in cells.  4 cells at 5 cm is +/-20 cm,
+    # which is the drift this is meant to catch; a wider search mostly buys
+    # opportunities to lock onto a corridor wall at the wrong offset.
+    search_cells: int = 4
+    # No more than one hint per this many milliseconds.  A correction the robot
+    # has not had time to apply is a correction that will be measured again.
+    min_hint_interval_ms: float = 2000.0
+
+    def __post_init__(self) -> None:
+        if self.z_min >= self.z_max:
+            raise ConfigError("compare.z_min must be below compare.z_max")
+        if self.min_points < 1:
+            raise ConfigError("compare.min_points must be >= 1")
+        if self.search_cells < 0:
+            raise ConfigError("compare.search_cells must be >= 0")
+
+
+@dataclass
+class MissionConfig:
+    """The phases, the exits, and what T2 is looking for."""
+
+    # Which row of the system diagram a session starts on when its hello does
+    # not say.  t1 is explore-and-map; t2 is seek.
+    phase: str = "t1"
+    # Free text handed to whatever runs the decision stage in t2.  Empty means
+    # the robot is expected to declare it in its hello, which is the normal case
+    # -- the mission belongs to the run, not to the server's config file.
+    target: str = ""
+    # Rank exit candidates and answer them.  Off leaves the robot's own ordering
+    # untouched, which is what you want while the ranking is being developed.
+    rank_exits: bool = True
+    # Narrowest gap the ranking will recommend driving through.  The Mecanumbot
+    # is 28 cm across the wheels; 60 cm leaves room for the fact that a frontier
+    # width is measured on a grid, not with calipers.
+    min_exit_width_m: float = 0.6
+    # Metres per radian charged against an exit for having to turn to face it.
+    # A tie-breaker at this robot's driving and turning speeds, not a model.
+    turn_cost_m_per_rad: float = 0.5
+    # Standoff for the approach pose in a found announcement: how far short of
+    # the target the robot should stop.  Its reach plus its radius.
+    approach_standoff_m: float = 0.8
+
+    def __post_init__(self) -> None:
+        if self.phase not in ("t1", "t2"):
+            raise ConfigError(f"mission.phase must be 't1' or 't2', got {self.phase!r}")
+        if self.min_exit_width_m < 0.0:
+            raise ConfigError("mission.min_exit_width_m must be >= 0")
+
+
+@dataclass
 class SnapshotConfig:
     """Periodically write a decoded frame to disk.
 
@@ -199,6 +366,10 @@ class Config:
     processor: ProcessorConfig = field(default_factory=ProcessorConfig)
     lidar: LidarConfig = field(default_factory=LidarConfig)
     imu: ImuConfig = field(default_factory=ImuConfig)
+    odom: OdomConfig = field(default_factory=OdomConfig)
+    map: MapConfig = field(default_factory=MapConfig)
+    compare: CompareConfig = field(default_factory=CompareConfig)
+    mission: MissionConfig = field(default_factory=MissionConfig)
     snapshot: SnapshotConfig = field(default_factory=SnapshotConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
@@ -229,6 +400,10 @@ class Config:
             ("processor", ProcessorConfig),
             ("lidar", LidarConfig),
             ("imu", ImuConfig),
+            ("odom", OdomConfig),
+            ("map", MapConfig),
+            ("compare", CompareConfig),
+            ("mission", MissionConfig),
             ("snapshot", SnapshotConfig),
             ("logging", LoggingConfig),
         ):
