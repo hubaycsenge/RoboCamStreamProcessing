@@ -9,7 +9,7 @@ through a fixed SSH rendezvous on the `nipg1` login node, so which node the job
 landed on is never the robot's problem. See [Networking](#networking).
 
 **Status: transport layer complete and measured; the first model is in; the map
-loop is wired.** `stats` still answers "are frames actually arriving, and what
+loop is wired; T2's decision stage is in.** `stats` still answers "are frames actually arriving, and what
 shape are they?" and remains the default, because it needs no weights and so
 keeps the transport checkable independently of any model. `deep3r` runs CUT3R
 over the stream and returns a metric point cloud per frame — see
@@ -381,7 +381,7 @@ and negligible next to a JPEG. Only `frame` messages carry a payload.
 | `phase` | both | move between `t1` (explore) and `t2` (seek) |
 | `map_update` | → robot | **announcement**: cells `compare` wants merged |
 | `pose_hint` | → robot | **announcement**: a correction *offered* to SLAM |
-| `found` | → robot | **announcement**: the target, and where to go for it |
+| `found` | → robot | **announcement**: the target, where to go for it, and whether the gripper can reach it |
 | `ping` / `pong` | both | liveness |
 | `bye` | both | graceful close |
 | `error` | → robot | malformed request |
@@ -448,13 +448,17 @@ The two that matter most:
   `newest` if a model needs strictly consecutive frames, which MASt3R and VGGT
   may well want.
 
-And two that describe the robot rather than a preference, so they are worth
+And three that describe the robot rather than a preference, so they are worth
 measuring rather than accepting:
 
 - `compare.camera_z` (default 0.45) — the camera's height above the floor, in
   metres. Wrong here puts every reconstructed surface at the wrong height, which
   moves a table top out of `compare.z_min .. z_max` entirely and produces a
   comparison that runs perfectly and finds nothing.
+- `seek.grasp_z_max` (default 0.12) — the top of the gripper's vertical envelope,
+  above the floor. It is what every `reachable` verdict is judged against, and it
+  inherits `camera_z`'s error: a camera height 10 cm out moves every object's
+  reported height by 10 cm, so measure that one first.
 - `odom.expect_frame` (default `map`) — the frame poses must arrive in. See
   [The map loop](#the-map-loop).
 
@@ -811,6 +815,9 @@ Run it:
 # server: the full loop
 ./scripts/run_deep3r.sh
 
+# server: t2, with a target named at launch
+./scripts/run_deep3r.sh --phase t2 --detector owl --target 'the red mug on the desk'
+
 # robot
 python3 robocam_client.py --lidar auto --imu auto --odom auto --map auto
 ```
@@ -836,10 +843,189 @@ exit instead of seeking until it times out.
 Either end may change phase; the receiver echoes it back with `accepted`, which
 is what stops the two spending a minute in different phases after a lost message.
 
-**Not yet implemented:** the decision stage itself. The `found` message, its
-plumbing and the phase machine are in place and tested — a processor emits one
-with `frame.announce(wire.found(...))` and the server does the rest — but nothing
-in this repo yet decides *whether* the target is in view. That is the next piece.
+### When is T1 finished?
+
+The server evaluates it on every uploaded grid and reports the verdict in
+`map_result.data.t1_exit`. It never changes phase on its own: the transition is a
+decision about the mission, it belongs to whoever is running the mission, and a
+server that switched by itself would also have to be argued with to end T1 early
+for a demo.
+
+Four tests, and no one of them is enough alone:
+
+| Test | What it catches | Why it is not sufficient alone |
+| --- | --- | --- |
+| `explored` | how much of the grid has been observed | the grid is a rectangle and rooms are not, so some fraction is permanently behind a wall and it never reaches 1.0 |
+| `no_open_exits` | frontiers the robot itself still calls worth driving to — **the decisive one** | it is empty at the start of a run, before the robot has found any |
+| `not_growing` | the map has stopped gaining cells | a robot pausing to turn looks stalled over a short window, hence `t1_min_stall_window_s` |
+| `placed` | mean cloud/grid `agreement` | nothing to do with coverage — see below |
+
+`no_open_exits` is the robot's judgement rather than the server's, for the same
+reason the exits themselves come from the robot: the robot is what knows which
+frontiers it has already tried.
+
+`placed` is the one worth arguing for, because it is not about the map at all.
+**T1's product is the cloud, not the grid.** Finishing T1 with a beautifully
+explored grid and a reconstruction that was never correctly placed leaves T2
+searching a cloud that does not line up with the room — and that failure surfaces
+an hour later as "the detector never sees anything", which is very hard to trace
+back to a transition made forty minutes earlier. `mean_agreement: null` (never
+compared: no grid, no pose, or compare off) and `0.0` (compared, and agreed with
+nothing: wrong camera height, wrong mount, pose in the wrong frame) are reported
+as different answers because they have different fixes.
+
+Two floors — `t1_min_frames` and `t1_min_runtime_s` — stop a first grid arriving
+before the robot has moved from satisfying everything at once.
+
+```json
+{"ready": false,
+ "tests": {"explored_fraction": 0.91, "explored": true,
+           "open_exits": 0, "no_open_exits": true,
+           "growth_cells_per_s": 2.1, "not_growing": true,
+           "mean_agreement": 0.04, "placed": false,
+           "frames": 4100, "runtime_s": 380.2, "past_minimums": true},
+ "blocking": ["cloud/grid agreement is 0.04, under 0.15 -- the reconstruction is
+               not placed where the map is, so T2 would search a cloud that does
+               not line up with the room"]}
+```
+
+### The decision stage
+
+The `LLM/decision making` box. It runs inside the `deep3r` processor, on the same
+frames the reconstruction is built from, and it is the reason `found` exists.
+
+```text
+  frame ──▶ detector ──▶ box ──▶ points behind the box ──▶ centroid
+              (words)            (the model's pointmap)         │
+                                                                ▼
+                                       T_map_cloud ──▶ map-frame coordinate
+                                                                │
+                        gripper envelope + the robot's grid ──▶ reachable?
+                                                                │
+                                                              found
+```
+
+**The detector is a seam, not a model.** `seek.detector` picks one:
+
+- **`owl`** — OWLv2 through transformers. Genuinely open-vocabulary: the mission
+  target is used as the query verbatim, which is what makes a target named at T2
+  launch possible at all. Downloads weights on first use.
+- **`colour`** — no weights, no network. Matches the colour word in the target and
+  finds the largest blob of it. It cannot tell a red mug from a red jumper, and
+  that is fine: it exists so the geometry *after* the box can be run end to end
+  without a checkpoint, exactly as `stats` keeps the transport checkable without a
+  model. It is the default for that reason.
+- **`none`** — finds nothing; measures what T2 costs without the detector.
+
+**Two queries go to the detector, not one.** `queries_from_target` sends the whole
+phrase first and the stripped noun phrase second: "on the desk" describes where to
+look rather than what to find, and a model matching the whole sentence scores the
+mug lower for the furniture in it.
+
+**A box is not a coordinate.** Three filters stand between them, and the third is
+the one that decides whether the answer is usable:
+
+1. *The crop.* CUT3R reconstructs a centre crop, not the frame, so a target at the
+   edge of the camera's view has a box and no points. Reported as
+   `outside_reconstruction` — the robot should turn towards it, not conclude the
+   object is gone.
+2. *Confidence.* The same `conf_self` gate the cloud uses. A box over a window is
+   where a monocular model is least sure and most wrong.
+3. *Depth.* A bounding box always contains background, so the centroid of
+   everything behind it lands between the object and the wall — typically a metre
+   past a mug on a desk, and entirely plausible-looking. The median range is taken
+   first and only points within `depth_band_m` of it are kept, which picks the
+   dominant surface in the box. When the box is mostly wall, the dominant surface
+   *is* the wall and the answer is confidently wrong; `points` and `spread_m`
+   travel to the robot in `found.evidence` so a reader can catch that.
+
+**Reachability is the server's to judge, and only the server can.** The robot's
+LiDAR sees one horizontal plane: asked whether the mug is on the floor or on the
+table it has nothing to say, because the two are the same reading. Height is
+exactly what the reconstruction knows and the scanner does not.
+
+```json
+"reachable": false,
+"reach": {"verdict": "too_high", "z_above_floor": 0.74,
+          "grasp_z": [-0.05, 0.12], "approach_range_m": 0.8,
+          "reason": "0.74 m above the floor, over the gripper's 0.12 m envelope"}
+```
+
+`reachable` is **three-valued** and the third value carries weight. `null` means
+the height could not be measured, and the robot's correct response is to drive
+over and look — which is different from its response to `false`. A robot testing
+`if header["reachable"]` treats `null` as "no"; testing `is False` treats it as
+"go and look". The verdicts are `reachable`, `too_high`, `below_floor` (under the
+map's floor plane, so a reconstruction error rather than an object),
+`no_standing_room` and `unknown`.
+
+An unreachable target still gets a `found` and still gets an approach pose:
+knowing where the mug is has value even when it is on a shelf, and the robot may
+well want to go and look at it. It simply will not waste a grasp attempt.
+
+**The approach pose is obstacle-checked.** The natural standoff pose — back along
+the line the robot is already on — is the first choice. A mug on the far side of a
+table puts that pose inside the table, so a ring of alternatives at the same
+radius is tried, nearest-in-angle first. `no_standing_room` means none of them was
+clear, and it is better than sending the robot to bump into the furniture.
+
+### Naming the target, and finding it before T2 starts
+
+The target is free text, and it is named when T2 starts:
+
+```bash
+./scripts/run_deep3r.sh --target 'the red mug on the desk' --detector owl
+```
+
+or by the robot, in its `hello` or in a `phase` message, which wins over the
+server's. Free text on purpose: it is the query the detector is given, so "the red
+mug on the desk" beats "mug", and constraining it to a class label would throw
+away the half of the description that makes the object findable.
+
+**But T1 explored without knowing what it would be asked for.** So T1 keeps
+keyframes — the image, plus the transform that puts that image's cloud in the map
+frame — and when a target is named at T2 launch, it is searched for in what T1
+already saw. A hit gives the robot a goal coordinate *before T2 has taken a single
+frame*, which is exactly the "go to where you last saw it" branch of the seek
+behaviour tree.
+
+That is what `found.basis` distinguishes, and the robot's two parallel branches
+are its two values:
+
+| `basis` | Meaning | The branch it feeds |
+| --- | --- | --- |
+| `live` | the decision stage is looking at it in this frame | the monitor branch: approach now, it is there |
+| `memory` | seen during T1, `age_s` seconds ago | the goto branch: drive there, keep watching, expect to search |
+| `absent` | looked, and it is not here (`found: false`) | stop waiting; start searching |
+
+A `found` from memory is not a claim that the object is there now — it is a claim
+about where it was and when. The object having moved is precisely the case the
+search behaviour exists for, and the live branch resolves the difference the
+moment the robot sees it.
+
+The retro-search is spread over incoming frames (`recall_budget_per_frame`)
+rather than run at once: the detector over two hundred keyframes is tens of
+seconds and the robot is still streaming. Keyframes are thinned by **distance
+travelled**, not by time, because a parked robot produces sixty identical frames
+and none of them is new evidence.
+
+### Moving coordinates between the cloud and the map
+
+`compare.cloud_to_map` and `compare.map_to_cloud` are a matrix and its inverse,
+both derived from `map_from_cloud_matrix` so they cannot drift apart:
+
+    T_map_cloud  =  T_map_base · T_base_cam · (T_cut3r_cam)⁻¹
+
+T1 only ever needs the first direction — the reconstruction is produced in the
+model's frame and compared against a grid drawn in the robot's. T2 needs both:
+once the robot has been told "the mug is at (3.2, 1.4)", every later question
+about that place is a question about a region of the *cloud*.
+
+`seek.Placement` bundles the matrix with the two identities that make it valid —
+`cloud_map_id`, which changes on every CUT3R reset, and `map_id`, which changes on
+a SLAM reset. Both are checked rather than trusted: a coordinate carried across
+either names a place in a frame that no longer exists, while looking exactly like
+a valid goal.
 
 ### Serving it
 
@@ -910,8 +1096,14 @@ robocam/                 server package
   imu.py                 burst decoding, attitude, still/moving
   odometry.py            pose decoding, and the frame check the map loop rests on
   occupancy.py           the 2D grid: decoding, patching, world <-> cell
-  compare.py             the Compare box: cloud vs. grid -> patch and pose hint
+  compare.py             the Compare box: cloud vs. grid -> patch and pose hint,
+                         and the cloud <-> map transform pair
   mission.py             exits, their ranking, the phase machine, approach poses
+  detect.py              the detector seam: open-vocabulary (owl), weightless
+                         (colour), and none
+  seek.py                the decision stage's geometry and policy: box -> cloud
+                         -> map coordinate, the reachability verdict, T1's
+                         keyframe memory, and the T1 exit criteria
   snapshot.py            periodic frame dumps, off the IO thread
   waker.py               lets workers interrupt poll() — see below
   processors/
@@ -919,8 +1111,9 @@ robocam/                 server package
     stats.py             default: geometry, rate, brightness
     noop.py              transport-ceiling benchmark
     fusion.py            stats plus the scan projected into the camera's view
-    deep3r.py            CUT3R streaming reconstruction -> point cloud, and the
-                         comparison against the robot's uploaded grid
+    deep3r.py            CUT3R streaming reconstruction -> point cloud, the
+                         comparison against the robot's uploaded grid, and the
+                         T2 decision stage that announces `found`
 link/                    everything crossing the robot <-> cluster boundary
   robocam_client.py      standalone data path, deploy to the Orin
   robot                  ros2 over the reverse tunnel, run from nipg1
@@ -936,7 +1129,7 @@ scripts/                 setup_server.sh, run_server.sh, run_deep3r.sh
                          reverse tunnel to the rendezvous on nipg1
 .venv/                   server only (numpy 2.x)
 .venv-cut3r/             server + torch + CUT3R (numpy 1.26.4)
-tests/                   300 tests, including real sockets end to end
+tests/                   380 tests, including real sockets end to end
 ```
 
 `waker.py` earns its place: without it a finished result waits for the current

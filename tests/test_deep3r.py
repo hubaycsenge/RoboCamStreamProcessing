@@ -584,3 +584,324 @@ def test_a_colourless_cloud_declares_a_shorter_point():
     cloud = proc._encode_cloud(pts, None, np.full(30, 5.0))
     assert cloud["pc2"]["point_step"] == 12
     assert [f["name"] for f in cloud["pc2"]["fields"]] == ["x", "y", "z"]
+
+
+# -- the decision stage ------------------------------------------------------
+#
+# The same trick as the comparison above: _decide takes a pointmap and a pose
+# and needs no model, so T2's whole journey -- detect, locate, judge, announce --
+# runs in the default venv with no weights and no card.
+
+
+class StubDetector:
+    """A detector that reports a fixed box, or nothing.
+
+    Standing in for OWLv2 so that what is being tested is the stage rather than
+    the model: everything interesting about T2 happens *after* the box.
+    """
+
+    name = "stub"
+    open_vocabulary = True
+
+    def __init__(self, box=(28, 20, 37, 29), score=0.9):
+        self.box, self.score = box, score
+        self.calls = []
+
+    def detect(self, image, queries):
+        from robocam.detect import Detection
+
+        self.calls.append(list(queries))
+        if self.box is None:
+            return []
+        return [Detection(box=self.box, score=self.score, label="mug",
+                          query=queries[0] if queries else "")]
+
+    def close(self):
+        pass
+
+
+PM_W, PM_H = 64, 48
+
+
+def a_seeking_proc(detector=None, **overrides):
+    """A processor configured for t2, with the detector already in place."""
+    from robocam.seek import ViewGeometry
+
+    proc = a_configured_proc(**overrides)
+    proc._detector = detector if detector is not None else StubDetector()
+    # setup() would have recorded this from the crop it actually applied; with no
+    # model there is no crop, so the pointmap is the frame.
+    proc._view_geometry = ViewGeometry(scale_x=1.0, scale_y=1.0, crop_x0=0, crop_y0=0,
+                                       out_w=PM_W, out_h=PM_H, src_w=PM_W, src_h=PM_H)
+    return proc
+
+
+def a_pointmap(object_depth=1.0, object_height=0.05, camera_z=0.45,
+               wall_depth=4.0, half=6):
+    """A wall, with one object patch in front of it at a known height.
+
+    Built in the model's optical frame (x right, y down, z forward) with the
+    camera at ``camera_z`` above the floor, so an object at ``object_height``
+    above the floor is ``camera_z - object_height`` *below* the optical axis.
+    """
+    pointmap = np.zeros((PM_H, PM_W, 3), dtype=np.float64)
+    pointmap[:, :, 2] = wall_depth
+    pointmap[:, :, 1] = camera_z          # the wall's points, at floor level
+    u, v = PM_W // 2, PM_H // 2
+    sl = (slice(v - half, v + half + 1), slice(u - half, u + half + 1))
+    pointmap[sl][:, :, 2] = object_depth
+    pointmap[sl][:, :, 1] = camera_z - object_height
+    pointmap[sl][:, :, 0] = 0.0
+    conf = np.full((PM_H, PM_W), 5.0)
+    return pointmap.reshape(-1, 3), conf.reshape(-1)
+
+
+def a_t2_frame(target="the red mug", **kwargs):
+    f = a_frame_with_a_map(**kwargs)
+    f.image = np.zeros((PM_H, PM_W, 3), np.uint8)
+    f.phase = "t2"
+    f.mission = {"target": target}
+    return f
+
+
+def test_t1_keeps_keyframes_and_announces_nothing():
+    """The half of the mission that cannot be done live.
+
+    T1 explores before the target has been named, so the only thing it can
+    usefully do about a target is remember what it saw.
+    """
+    proc = a_seeking_proc()
+    f = a_frame_with_a_map()
+    f.image = np.zeros((PM_H, PM_W, 3), np.uint8)
+    points, conf = a_pointmap()
+
+    stats = proc._decide(f, points, conf, np.eye(4))
+
+    assert stats["ran"] is False
+    assert "t1" in stats["why"]
+    assert stats["kept_keyframe"] is True
+    assert f.announcements == []
+
+
+def test_t2_without_a_target_says_so_rather_than_searching_for_nothing():
+    proc = a_seeking_proc()
+    f = a_t2_frame(target="")
+    points, conf = a_pointmap()
+    stats = proc._decide(f, points, conf, np.eye(4))
+    assert stats["ran"] is False
+    assert "no target" in stats["why"]
+
+
+def test_a_disabled_stage_and_a_missing_detector_are_different_answers():
+    """Both produce no `found`, and they have different fixes."""
+    from robocam.config import Config
+
+    cfg = Config()
+    cfg.seek.enabled = False
+    off = make_proc()
+    off.configure(cfg.lidar, cfg.imu, cfg)
+    assert "disabled" in off._decide(a_t2_frame(), *a_pointmap(), np.eye(4))["why"]
+
+    missing = a_configured_proc()
+    missing._detector = None
+    assert "no detector" in missing._decide(a_t2_frame(), *a_pointmap(), np.eye(4))["why"]
+
+
+def test_a_found_carries_a_map_frame_coordinate_and_an_approach():
+    """T2 end to end: a box becomes a goal the robot can drive to."""
+    proc = a_seeking_proc(compare={"camera_z": 0.45, "camera_x": 0.0},
+                          seek={"detect_every_n": 1})
+    f = a_t2_frame()
+    points, conf = a_pointmap(object_depth=1.0, object_height=0.05)
+
+    stats = proc._decide(f, points, conf, np.eye(4))
+
+    assert stats["ran"] is True
+    assert len(f.announcements) == 1
+    header, _ = f.announcements[0]
+    assert header["type"] == "found"
+    assert header["found"] is True
+    assert header["frame"] == "map"
+    assert header["map_id"] == "m1"
+    assert header["basis"] == "live"
+    # The robot is at (0.5, 2.0) looking down +x, the object 1 m ahead of the
+    # camera, which sits at the base origin in this config.
+    assert header["x"] == pytest.approx(1.5, abs=0.05)
+    assert header["y"] == pytest.approx(2.0, abs=0.05)
+    assert header["z"] == pytest.approx(0.05, abs=0.03)
+    # seq is left for the server to stamp, as with every other announcement.
+    assert header["seq"] == 0
+    approach = header["approach"]
+    assert approach["x"] < header["x"], "the approach stops short of the object"
+
+
+def test_an_object_on_the_floor_is_reported_reachable():
+    proc = a_seeking_proc(compare={"camera_z": 0.45, "camera_x": 0.0},
+                          seek={"detect_every_n": 1, "grasp_z_max": 0.12})
+    f = a_t2_frame()
+    proc._decide(f, *a_pointmap(object_height=0.05), np.eye(4))
+    header, _ = f.announcements[0]
+    assert header["reachable"] is True
+    assert header["reach"]["verdict"] == "reachable"
+
+
+def test_an_object_on_a_table_is_reported_unreachable_before_the_robot_drives():
+    """The verdict the LiDAR cannot produce, arriving before the drive rather
+    than after a failed grasp."""
+    proc = a_seeking_proc(compare={"camera_z": 0.45, "camera_x": 0.0},
+                          seek={"detect_every_n": 1, "grasp_z_max": 0.12})
+    f = a_t2_frame()
+    proc._decide(f, *a_pointmap(object_height=0.75), np.eye(4))
+    header, _ = f.announcements[0]
+    assert header["reachable"] is False
+    assert header["reach"]["verdict"] == "too_high"
+    # Still a found, and still with an approach: knowing where it is has value
+    # even when it cannot be picked up.
+    assert header["found"] is True
+    assert header["approach"]["x"] == pytest.approx(header["x"] - 0.8, abs=0.05)
+
+
+def test_the_target_text_reaches_the_detector_verbatim():
+    """It is a prompt, not a class label; constraining it would throw away the
+    half of the description that makes the object findable."""
+    detector = StubDetector()
+    proc = a_seeking_proc(detector, seek={"detect_every_n": 1})
+    proc._decide(a_t2_frame(target="the red mug on the desk"), *a_pointmap(), np.eye(4))
+    assert detector.calls[0][0] == "the red mug on the desk"
+
+
+def test_nothing_seen_and_nothing_remembered_eventually_says_so():
+    """"I have looked and it is not here" is what lets the robot stop waiting on
+    its monitor branch and start searching."""
+    proc = a_seeking_proc(StubDetector(box=None),
+                          seek={"detect_every_n": 1, "absent_after_runs": 3})
+    announcements = []
+    for _ in range(3):
+        f = a_t2_frame()
+        proc._decide(f, *a_pointmap(), np.eye(4))
+        announcements.extend(f.announcements)
+
+    assert len(announcements) == 1
+    header, _ = announcements[0]
+    assert header["type"] == "found"
+    assert header["found"] is False
+    assert header["basis"] == "absent"
+    assert header["reachable"] is None
+
+
+def test_a_low_scoring_detection_is_not_acted_on():
+    proc = a_seeking_proc(StubDetector(score=0.05),
+                          seek={"detect_every_n": 1, "min_confidence": 0.25})
+    f = a_t2_frame()
+    stats = proc._decide(f, *a_pointmap(), np.eye(4))
+    assert f.announcements == []
+    assert "min_confidence" in stats["rejected"]
+
+
+def test_founds_are_rate_limited_because_the_robot_acts_on_them():
+    proc = a_seeking_proc(seek={"detect_every_n": 1,
+                                "min_found_interval_ms": 60_000.0,
+                                "resend_move_m": 10.0})
+    seen = 0
+    for _ in range(5):
+        f = a_t2_frame()
+        proc._decide(f, *a_pointmap(), np.eye(4))
+        seen += len(f.announcements)
+    assert seen == 1
+
+
+def test_a_target_that_has_moved_is_news_inside_the_interval():
+    proc = a_seeking_proc(seek={"detect_every_n": 1,
+                                "min_found_interval_ms": 60_000.0,
+                                "resend_move_m": 0.3})
+    first = a_t2_frame()
+    proc._decide(first, *a_pointmap(object_depth=1.0), np.eye(4))
+    moved = a_t2_frame()
+    proc._decide(moved, *a_pointmap(object_depth=2.0), np.eye(4))
+    assert len(first.announcements) == 1
+    assert len(moved.announcements) == 1
+
+
+def test_a_target_named_at_t2_is_looked_for_in_what_t1_saw():
+    """The mission's shape, in one test.
+
+    T1 explores without knowing what it will be asked for.  The target is named
+    at T2 launch, and the answer already exists in the keyframes T1 kept -- so the
+    robot gets a goal coordinate before T2 has taken a single frame of its own.
+    """
+    detector = StubDetector()
+    proc = a_seeking_proc(detector, compare={"camera_z": 0.45, "camera_x": 0.0},
+                          seek={"detect_every_n": 1})
+    points, conf = a_pointmap(object_depth=1.0, object_height=0.05)
+
+    # T1: drive along, keeping keyframes.  No target is named yet.
+    for i in range(4):
+        f = a_frame_with_a_map()
+        f.image = np.zeros((PM_H, PM_W, 3), np.uint8)
+        f.odom.x = 0.5 + i          # far enough apart to each be kept
+        proc._decide(f, points, conf, np.eye(4))
+    assert len(proc._keyframes) == 4
+
+    # T2 begins, and the target is named for the first time.  This frame's own
+    # view is of nothing: only the memory can answer.
+    detector.box = None
+    live_miss = np.zeros_like(points)
+    live_conf = np.zeros_like(conf)
+    f = a_t2_frame(target="the red mug")
+
+    def only_in_keyframes(image, queries):
+        from robocam.detect import Detection
+        # Blank frames are the live ones; the stored keyframes are not blank.
+        if not image.any():
+            return []
+        return [Detection(box=(28, 20, 37, 29), score=0.9, label="mug")]
+
+    detector.detect = only_in_keyframes
+    f.image = np.zeros((PM_H, PM_W, 3), np.uint8)
+    for kf in proc._keyframes.newest_first():
+        kf.image = np.ones((PM_H, PM_W, 3), np.uint8)
+
+    stats = proc._decide(f, live_miss, live_conf, np.eye(4))
+
+    assert stats["ran"] is True
+    assert len(f.announcements) == 1
+    header, _ = f.announcements[0]
+    assert header["found"] is True
+    assert header["basis"] == "memory", "this coordinate came from what t1 saw"
+    assert header["x"] == pytest.approx(3.5 + 1.0, abs=0.05), \
+        "the newest keyframe was taken at x=3.5, with the object 1 m ahead"
+
+
+def test_a_live_sighting_supersedes_the_remembered_one():
+    """A remembered coordinate is a claim about the past; the present beats it."""
+    proc = a_seeking_proc(compare={"camera_z": 0.45, "camera_x": 0.0},
+                          seek={"detect_every_n": 1, "min_found_interval_ms": 0.0})
+    f = a_t2_frame()
+    proc._decide(f, *a_pointmap(), np.eye(4))
+    header, _ = f.announcements[0]
+    assert header["basis"] == "live"
+
+
+def test_the_stage_needs_a_pose_to_produce_a_map_frame_coordinate():
+    """Without one the cloud sits in CUT3R's own world frame, whose origin
+    nobody chose and which no behaviour tree can navigate in."""
+    proc = a_seeking_proc()
+    f = a_t2_frame()
+    f.odom = None
+    stats = proc._decide(f, *a_pointmap(), np.eye(4))
+    assert stats["ran"] is False
+    assert "pose" in stats["why"]
+    assert f.announcements == []
+
+
+def test_a_detector_that_raises_does_not_kill_the_session():
+    class Exploding(StubDetector):
+        def detect(self, image, queries):
+            raise RuntimeError("cuda oom")
+
+    proc = a_seeking_proc(Exploding(), seek={"detect_every_n": 1})
+    f = a_t2_frame()
+    stats = proc._decide(f, *a_pointmap(), np.eye(4))
+    assert stats["ran"] is True
+    assert "detect_error" in stats
+    assert f.announcements == []

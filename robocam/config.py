@@ -320,11 +320,159 @@ class MissionConfig:
     # the target the robot should stop.  Its reach plus its radius.
     approach_standoff_m: float = 0.8
 
+    # -- when T1 is finished ------------------------------------------------
+    # Evaluated on every uploaded grid and reported in the map reply; the server
+    # never changes phase on its own.  See robocam.seek.t1_exit_criteria for
+    # what each test is for and why no one of them suffices alone.
+    #
+    # Report the verdict at all.  Off makes the whole evaluation a no-op, for a
+    # run whose phases are being driven by hand.
+    t1_exit_report: bool = True
+    # Share of the grid that must have been observed.  Never 1.0: the grid is a
+    # rectangle and rooms are not, so some of it is permanently behind a wall.
+    t1_min_explored: float = 0.80
+    # Open frontier candidates, at least min_exit_width_m wide, still to visit.
+    t1_max_open_exits: int = 0
+    # Newly observed cells per second below which the map has stopped growing.
+    t1_stall_cells_per_s: float = 15.0
+    # How long that rate must have been measurable before it counts.  Shorter
+    # than this and a robot pausing to turn looks like a finished map.
+    t1_min_stall_window_s: float = 30.0
+    # Mean cloud/grid agreement.  T1's product is the cloud, so finishing with a
+    # good map and a cloud that was never correctly placed leaves T2 nothing to
+    # search -- which surfaces an hour later as "the detector never sees
+    # anything" and is very hard to trace back to here.
+    t1_min_agreement: float = 0.15
+    # Floors, so that a first grid arriving before the robot has moved cannot
+    # satisfy every other test at once.
+    t1_min_frames: int = 300
+    t1_min_runtime_s: float = 60.0
+
     def __post_init__(self) -> None:
         if self.phase not in ("t1", "t2"):
             raise ConfigError(f"mission.phase must be 't1' or 't2', got {self.phase!r}")
         if self.min_exit_width_m < 0.0:
             raise ConfigError("mission.min_exit_width_m must be >= 0")
+        if not 0.0 <= self.t1_min_explored <= 1.0:
+            raise ConfigError("mission.t1_min_explored must be between 0 and 1")
+
+
+@dataclass
+class SeekConfig:
+    """The decision stage: what T2 looks for, and what it can pick up.
+
+    Split from ``mission`` on purpose.  ``mission`` is what this run is about —
+    the phase, the target, the exits — and changes per run; this is what the
+    robot and its detector *are*, and changes when the hardware does.
+    """
+
+    # Run the decision stage at all.  Off leaves T2 a navigation phase with no
+    # target search, which is what you want while the detector is being fitted.
+    enabled: bool = True
+
+    # -- the detector -------------------------------------------------------
+    # "colour" needs no weights and matches a colour word in the target text: it
+    #     exists so the geometry after the box can be exercised end to end
+    #     without a checkpoint, in the same spirit as the "stats" processor.
+    # "owl"    is OWLv2 through transformers: real open-vocabulary detection,
+    #     the target text used as the query. This is the one that actually seeks.
+    # "none"   finds nothing, for measuring T2 without the detector's cost.
+    detector: str = "colour"
+    # Passed verbatim to the detector's constructor.  For "owl": model, device,
+    # score_min, max_detections.
+    detector_options: Dict[str, Any] = field(default_factory=dict)
+    # Run the detector on one frame in N.  The detector is the expensive half of
+    # T2 and the target does not move at the frame rate; skipping in the stage is
+    # better than letting the queue evict, for the same reason deep3r's every_n
+    # is -- the frames that run are chosen rather than whichever ones happened to
+    # arrive between forward passes.
+    detect_every_n: int = 2
+
+    # -- believing a detection ----------------------------------------------
+    # Score below which a detection is not acted on.  The detector's own floor is
+    # lower and deliberately so: it returns candidates, this decides.
+    min_confidence: float = 0.25
+    # Cloud points that must survive confidence and depth filtering inside the
+    # box before a coordinate is believed.  Six points is a guess; the default is
+    # the point at which a centroid means something.
+    min_points: int = 8
+    # Confidence gate on the points inside the box, on CUT3R's conf_self scale
+    # (which starts at 1.0, not 0.0).  Looser than the cloud's own filter,
+    # because a small object at range is exactly where the model is less certain
+    # and dropping it entirely loses the target rather than a bit of a wall.
+    min_point_conf: float = 1.5
+    # Half-width of the depth band kept around the box's median range.  This is
+    # what stops a bounding box's background dragging the coordinate to the wall
+    # behind the object; 25 cm keeps a mug and drops the desk behind it.
+    depth_band_m: float = 0.25
+    # Fraction of each side of the box kept when sampling points.  The corners of
+    # a bounding box are background and are also where a monocular
+    # reconstruction is least reliable.
+    box_keep_frac: float = 0.7
+
+    # -- announcing ---------------------------------------------------------
+    # Smallest gap between two "found" announcements, milliseconds.  Unlike the
+    # map updates this is generous rather than tight: the robot acts on a found,
+    # and a stream of them at the frame rate is a behaviour tree that never
+    # finishes reacting to the first.
+    min_found_interval_ms: float = 1000.0
+    # Announce a "found: false" after this many consecutive detector runs in t2
+    # with nothing.  It is what lets the robot stop waiting and start searching
+    # rather than seeking until it times out.  0 disables.
+    absent_after_runs: int = 30
+    # Re-announce the same live sighting when it has moved by this much, even
+    # inside the interval above.  A target that has actually moved is news.
+    resend_move_m: float = 0.35
+
+    # -- the gripper, in metres: tape-measure facts about this robot ---------
+    # THE number to get right.  The Mecanumbot's gripper closes at floor level,
+    # so an object higher than this is not collectable however close it drives.
+    # Knowing that before driving is the whole value of having a reconstruction
+    # rather than a scanner, which cannot tell the floor from the table at all.
+    grasp_z_max: float = 0.12
+    # Below the map's floor plane is a reconstruction error, not an object.
+    # Slightly negative because the floor plane is a plane and a real floor is not.
+    grasp_z_min: float = -0.05
+    # How far from the base centre the gripper closes.  Used to ask whether any
+    # standing position puts the object in range.
+    reach_radius_m: float = 0.45
+    # Footprint radius, for deciding whether a candidate standing cell is clear.
+    # The Mecanumbot is 28 cm across the wheels; this is that plus a margin.
+    robot_radius_m: float = 0.22
+
+    # -- remembering T1 -----------------------------------------------------
+    # Keep keyframes during t1 so that a target named at t2 launch can be looked
+    # for in what t1 already saw.  This is what produces a goal coordinate before
+    # t2 has taken a single frame, and it is off-by-default nowhere: the mission
+    # shape in the README depends on it.
+    keyframes: bool = True
+    # Bound on the memory.  240 frames at the spacing below is a large room.
+    keyframe_max: int = 240
+    # Minimum movement between kept keyframes.  Thinned by distance rather than
+    # time because a parked robot produces sixty identical frames and none of
+    # them is new evidence.
+    keyframe_spacing_m: float = 0.25
+    keyframe_spacing_rad: float = 0.35
+    # Keyframes searched per incoming frame when t2 starts.  The retro-search
+    # runs against the whole store and must not stall the stream, so it is spread
+    # over the frames that arrive while it runs.
+    recall_budget_per_frame: int = 3
+    # How long a remembered coordinate stays worth driving to.
+    memory_ttl_s: float = 900.0
+
+    def __post_init__(self) -> None:
+        if self.detect_every_n < 1:
+            raise ConfigError("seek.detect_every_n must be >= 1")
+        if self.grasp_z_max <= self.grasp_z_min:
+            raise ConfigError(
+                f"seek.grasp_z_max ({self.grasp_z_max}) must be above grasp_z_min "
+                f"({self.grasp_z_min}); as written the gripper envelope is empty and "
+                "nothing would ever be reachable"
+            )
+        if self.min_points < 1:
+            raise ConfigError("seek.min_points must be >= 1")
+        if not 0.0 < self.box_keep_frac <= 1.0:
+            raise ConfigError("seek.box_keep_frac must be in (0, 1]")
 
 
 @dataclass
@@ -370,6 +518,7 @@ class Config:
     map: MapConfig = field(default_factory=MapConfig)
     compare: CompareConfig = field(default_factory=CompareConfig)
     mission: MissionConfig = field(default_factory=MissionConfig)
+    seek: SeekConfig = field(default_factory=SeekConfig)
     snapshot: SnapshotConfig = field(default_factory=SnapshotConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
@@ -404,6 +553,7 @@ class Config:
             ("map", MapConfig),
             ("compare", CompareConfig),
             ("mission", MissionConfig),
+            ("seek", SeekConfig),
             ("snapshot", SnapshotConfig),
             ("logging", LoggingConfig),
         ):

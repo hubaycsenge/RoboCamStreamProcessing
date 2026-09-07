@@ -3378,14 +3378,27 @@ class RoboCamClient:
         if mtype == MSG_FOUND:
             self.founds_received += 1
             approach = header.get("approach") or {}
-            log.info("%s %r at (%.2f, %.2f) confidence %.2f; approach (%.2f, %.2f) "
-                     "facing %+.0f deg -- %s",
+            reachable = header.get("reachable")
+            # Three-valued on purpose: null means the height could not be
+            # measured, and the right response to it is to drive over and look
+            # rather than to treat it as either yes or no. Printed as its own
+            # word for that reason -- "unknown" reads differently from "no".
+            reach_word = ("reachable" if reachable is True
+                          else "UNREACHABLE" if reachable is False
+                          else "reachability unknown")
+            verdict = (header.get("reach") or {}).get("verdict", "")
+            log.info("%s %r at (%.2f, %.2f, %.2f) confidence %.2f [%s%s]; "
+                     "approach (%.2f, %.2f) facing %+.0f deg; %s -- %s",
                      "FOUND" if header.get("found") else "NOT FOUND:",
                      header.get("target", ""), header.get("x", 0.0), header.get("y", 0.0),
-                     header.get("confidence", 0.0),
+                     header.get("z", 0.0), header.get("confidence", 0.0),
+                     header.get("basis", "live"),
+                     (", %.0fs old" % header.get("age_s", 0.0)
+                      if header.get("basis") == "memory" else ""),
                      approach.get("x", header.get("x", 0.0)),
                      approach.get("y", header.get("y", 0.0)),
                      math.degrees(approach.get("yaw", header.get("yaw", 0.0))),
+                     f"{reach_word} ({verdict})" if verdict else reach_word,
                      header.get("rationale", "") or header.get("decider", ""))
             if self.on_found is not None:
                 try:

@@ -1024,3 +1024,124 @@ def test_the_real_client_uploads_a_map_and_a_pose(server):
     assert client._last_map_summary["explored_fraction"] > 0
     # The pose and the grid agree on their frame, so the server can compare.
     assert client._last_odom_summary["usable_for_compare"] is True
+
+
+# -- is T1 finished? ---------------------------------------------------------
+
+@pytest.fixture
+def server_t1():
+    """A server whose T1 thresholds a single small test map can actually meet."""
+    with running_server(mission={"t1_min_explored": 0.5, "t1_min_frames": 0,
+                                 "t1_min_runtime_s": 0.0,
+                                 "t1_min_stall_window_s": 0.0}) as running:
+        yield running
+
+
+def a_half_explored_grid(explored=0.9):
+    cells = np.full((40, 40), -1, dtype=np.int8)
+    observed = int(explored * cells.size)
+    cells.reshape(-1)[:observed] = 0
+    return cells
+
+
+def test_the_map_reply_says_whether_t1_looks_finished(server_t1):
+    """The verdict travels back with the grid it was computed from.
+
+    On the same message rather than on a new one: the answer is a property of
+    that upload, and a robot that has the grid and not the verdict would have to
+    correlate two streams to find out what its own map means.
+    """
+    _, endpoint = server_t1
+    peer = RawPeer(endpoint, b"t1-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send_odom(1, x=0.5, y=0.5)
+    peer.recv_of_type(wire.MSG_ODOM_RESULT)
+    peer.send_map(1, a_half_explored_grid())
+    reply = peer.recv_of_type(wire.MSG_MAP_RESULT)
+
+    verdict = reply["data"]["t1_exit"]
+    assert verdict["ready"] is False, "nothing has been compared yet"
+    assert verdict["tests"]["explored"] is True
+    # The reconstruction was never placed, so T1's actual product is missing --
+    # and that is the test which is blocking, not the coverage.
+    assert verdict["tests"]["placed"] is False
+    assert any("never been compared" in reason for reason in verdict["blocking"])
+    peer.close()
+
+
+def test_an_open_exit_blocks_the_transition(server_t1):
+    """The decisive test, and the robot's judgement rather than the server's:
+    the robot is what knows which frontiers it has already tried."""
+    _, endpoint = server_t1
+    peer = RawPeer(endpoint, b"t1exit-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    peer.send(wire.exits(0, [{"id": "door-3", "x": 4.0, "y": 0.0, "width_m": 0.9,
+                              "status": "open"}], t_capture_ns=1))
+    peer.recv_of_type(wire.MSG_EXITS_RESULT)
+    peer.send_map(1, a_half_explored_grid())
+    reply = peer.recv_of_type(wire.MSG_MAP_RESULT)
+
+    verdict = reply["data"]["t1_exit"]
+    assert verdict["tests"]["open_exits"] == 1
+    assert verdict["tests"]["no_open_exits"] is False
+    assert verdict["ready"] is False
+    peer.close()
+
+
+def test_the_report_can_be_switched_off():
+    with running_server(mission={"t1_exit_report": False}) as (_, endpoint):
+        peer = RawPeer(endpoint, b"t1off-peer")
+        peer.send(wire.hello("pytest"))
+        peer.recv_of_type(wire.MSG_WELCOME)
+        peer.send_map(1, a_half_explored_grid())
+        reply = peer.recv_of_type(wire.MSG_MAP_RESULT)
+        assert "t1_exit" not in reply["data"]
+        peer.close()
+
+
+def test_the_server_never_changes_phase_by_itself(server_t1):
+    """A recommendation, not an action.
+
+    The transition between exploring and seeking is a decision about the
+    mission; a server that made it on its own would also have to be argued with
+    to end T1 early for a demo.
+    """
+    srv, endpoint = server_t1
+    peer = RawPeer(endpoint, b"t1phase-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+    peer.send_map(1, a_half_explored_grid(1.0))
+    peer.recv_of_type(wire.MSG_MAP_RESULT)
+
+    assert next(iter(srv.sessions.values())).phase == wire.PHASE_EXPLORE
+    peer.close()
+
+
+def test_the_welcome_says_whether_a_found_can_ever_arrive(server):
+    """A seek behaviour tree waiting on a monitor branch that no server feeds
+    waits forever and looks like it is searching."""
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"seekinfo-peer")
+    peer.send(wire.hello("pytest"))
+    welcome = peer.recv_of_type(wire.MSG_WELCOME)
+
+    seek = welcome["server"]["seek"]
+    assert seek["enabled"] is True
+    assert seek["detector"]
+    assert seek["grasp_z"][1] > seek["grasp_z"][0]
+    assert "memory" in seek["basis"]
+    peer.close()
+
+
+def test_a_server_with_the_decision_stage_off_says_so():
+    with running_server(seek={"enabled": False}) as (_, endpoint):
+        peer = RawPeer(endpoint, b"noseek-peer")
+        peer.send(wire.hello("pytest"))
+        welcome = peer.recv_of_type(wire.MSG_WELCOME)
+        assert welcome["server"]["seek"]["enabled"] is False
+        assert welcome["server"]["seek"]["detector"] == ""
+        peer.close()

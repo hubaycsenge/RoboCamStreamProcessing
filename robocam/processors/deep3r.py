@@ -77,18 +77,25 @@ of what was seen, instead of clipping a long corridor.
 from __future__ import annotations
 
 import base64
+import logging
+import math
 import os
 import sys
 import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
+import cv2
 import numpy as np
 
+from .. import detect as detect_mod
+from .. import seek as seek_mod
 from .. import wire
 from ..compare import CameraMount, compare
 from ..occupancy import encode_cells
 from .base import Frame, Processor
+
+log = logging.getLogger(__name__)
 
 # Millimetre-ish resolution is far finer than the model's own accuracy, so 16
 # bits over the cloud's own extent loses nothing that matters: a 20 m span
@@ -186,6 +193,7 @@ class Deep3RProcessor(Processor):
         colors: bool = True,
         lidar_check: bool = True,
         compare_map: bool = True,
+        seek: bool = True,
         **options: Any,
     ) -> None:
         super().__init__(
@@ -193,7 +201,7 @@ class Deep3RProcessor(Processor):
             every_n=every_n, min_conf=min_conf, voxel_m=voxel_m,
             max_points=max_points, reset_every=reset_every,
             reset_on_gap=reset_on_gap, colors=colors, lidar_check=lidar_check,
-            compare_map=compare_map, **options,
+            compare_map=compare_map, seek=seek, **options,
         )
         self.cut3r_root = os.path.expanduser(str(cut3r_root))
         self.weights = os.path.expanduser(str(weights))
@@ -208,11 +216,35 @@ class Deep3RProcessor(Processor):
         self.colors = bool(colors)
         self.lidar_check = bool(lidar_check)
         self.compare_map = bool(compare_map)
+        self.seek = bool(seek)
         # Filled in by configure(); the defaults describe a camera at 45 cm
         # looking level, which is this robot with its neck at rest.
         self._mount = CameraMount()
         self._compare_cfg = None
         self._map_cfg = None
+        self._seek_cfg = None
+        self._mission_cfg = None
+
+        # -- the decision stage --------------------------------------------
+        # Created in setup() for the same reason the model is: a detector that
+        # loaded here would load on the server's IO thread.
+        self._detector = None
+        self._envelope = seek_mod.ReachEnvelope()
+        self._keyframes: Optional[seek_mod.KeyframeStore] = None
+        self._memory = seek_mod.TargetMemory()
+        self._view_geometry = seek_mod.ViewGeometry()
+        # What the retro-search over T1's keyframes has left to do.  Non-empty
+        # only between entering t2 and either finding the target or running out
+        # of stored frames; drained a few frames at a time so the search never
+        # stalls the stream.
+        self._recall_queue: list = []
+        self._recall_target = ""
+        self._recall_done = False
+        self._seek_runs = 0
+        self._absent_runs = 0
+        self._last_found_ns = 0
+        self._last_announced: Optional[seek_mod.Sighting] = None
+        self._prev_phase = wire.PHASE_EXPLORE
 
         # Everything below is created in setup(), on the worker thread.
         self._torch = None
@@ -257,6 +289,28 @@ class Deep3RProcessor(Processor):
                 pitch=self._compare_cfg.camera_pitch,
                 yaw=self._compare_cfg.camera_yaw,
             )
+
+        # The decision stage's geometry is the robot's, on the same terms: the
+        # gripper envelope is a tape-measure fact and the standoff belongs to the
+        # mission, so neither is a processor option.
+        self._seek_cfg = getattr(config, "seek", None)
+        self._mission_cfg = getattr(config, "mission", None)
+        if self._seek_cfg is not None:
+            self._envelope = seek_mod.ReachEnvelope(
+                grasp_z_min=self._seek_cfg.grasp_z_min,
+                grasp_z_max=self._seek_cfg.grasp_z_max,
+                reach_radius_m=self._seek_cfg.reach_radius_m,
+                robot_radius_m=self._seek_cfg.robot_radius_m,
+                standoff_m=(self._mission_cfg.approach_standoff_m
+                            if self._mission_cfg is not None else 0.8),
+            )
+            self._memory = seek_mod.TargetMemory(ttl_s=self._seek_cfg.memory_ttl_s)
+            if self._seek_cfg.keyframes:
+                self._keyframes = seek_mod.KeyframeStore(
+                    max_frames=self._seek_cfg.keyframe_max,
+                    min_spacing_m=self._seek_cfg.keyframe_spacing_m,
+                    min_spacing_rad=self._seek_cfg.keyframe_spacing_rad,
+                )
 
     def setup(self) -> None:
         """Import CUT3R, load the checkpoint and warm the kernels up.
@@ -309,6 +363,31 @@ class Deep3RProcessor(Processor):
         # The warm-up is not a map; number the first real one 1.
         self._map_id = 0
 
+        self._setup_detector()
+
+    def _setup_detector(self) -> None:
+        """Build the T2 detector, on this thread, and never fatally.
+
+        A detector that fails to load must not take the reconstruction down with
+        it.  T1 does not use the detector at all and T2 without it still
+        navigates and still reports what T1 remembered, so the useful response to
+        a missing checkpoint is a loud log line and a server that keeps running —
+        not a Slurm job that exits twenty minutes into an experiment.
+        """
+        if not (self.seek and self._seek_cfg is not None and self._seek_cfg.enabled):
+            log.info("decision stage disabled; t2 will navigate without a target search")
+            return
+        name = self._seek_cfg.detector
+        try:
+            self._detector = detect_mod.build(name, dict(self._seek_cfg.detector_options))
+            self._detector.setup()
+        except Exception:  # noqa: BLE001 - see docstring
+            log.exception("detector %r failed to load; t2 will run without one", name)
+            self._detector = None
+            return
+        log.info("decision stage ready: detector=%s open_vocabulary=%s",
+                 self._detector.name, self._detector.open_vocabulary)
+
     @staticmethod
     def _patch_rope_for_pose_token() -> None:
         """Let the pure-PyTorch RoPE accept CUT3R's -1 pose-token position.
@@ -350,6 +429,14 @@ class Deep3RProcessor(Processor):
     def close(self) -> None:
         self._state = None
         self._model = None
+        if self._detector is not None:
+            try:
+                self._detector.close()
+            except Exception:  # pragma: no cover - teardown best effort
+                log.exception("detector close failed")
+            self._detector = None
+        if self._keyframes is not None:
+            self._keyframes.clear()
         if self._torch is not None:
             self._torch.cuda.empty_cache()
 
@@ -417,7 +504,330 @@ class Deep3RProcessor(Processor):
             data["scale_check"] = self._scale_check(frame, pts, conf)
         if self.compare_map:
             data["compare"] = self._compare_with_map(frame, kept_pts, pose_c2w)
+        if self.seek:
+            # The raw pointmap, not the reduced cloud.  The decision stage looks
+            # up the points behind a *pixel box*, which only the per-pixel map
+            # can answer: `kept_pts` has been confidence-filtered, voxelised and
+            # capped, and none of those survive the row-major indexing that ties
+            # a point back to the pixel it came from.
+            data["seek"] = self._decide(frame, pts, conf, pose_c2w)
         return data
+
+    # -- the decision stage --------------------------------------------------
+
+    def _placement(self, frame: Frame, pose_c2w) -> Optional["seek_mod.Placement"]:
+        """Tie this frame's cloud to the robot's map frame, or admit we cannot.
+
+        Everything the decision stage produces is a coordinate in the robot's
+        map, so without a pose there is nothing to produce: the cloud sits in
+        CUT3R's own world frame, whose origin nobody chose and which no
+        behaviour tree can navigate in.
+        """
+        if frame.odom is None:
+            return None
+        return seek_mod.Placement(
+            pose_c2w=pose_c2w,
+            odom=frame.odom,
+            mount=self._mount,
+            map_id=(frame.grid.map_id if frame.grid is not None else ""),
+            cloud_map_id=self._map_id,
+            frame=(frame.grid.frame if frame.grid is not None else frame.odom.frame),
+            t_ns=wire.monotonic_ns(),
+        )
+
+    def _store_keyframe(self, frame: Frame, points, conf, placement) -> bool:
+        """Keep this frame if T1 has not already seen this pose.
+
+        The stored copy is downscaled to the size the reconstruction ran at,
+        which is also all the detector needs: it is looking for an object that
+        fills a tenth of the frame, and a session of 720p frames is gigabytes.
+        The *placement* is not approximated — it is what turns a hit in an old
+        image into a coordinate in the current map.
+        """
+        if self._keyframes is None or not self._keyframes.should_keep(frame.odom):
+            return False
+        view = self._view_geometry
+        try:
+            small = cv2.resize(frame.image, (view.out_w, view.out_h),
+                               interpolation=cv2.INTER_AREA)
+        except Exception:  # noqa: BLE001 - a keyframe is never worth a failed frame
+            log.exception("keyframe resize failed at seq=%d", frame.seq)
+            return False
+        # Rewrite the geometry for the *stored* image, which is the crop itself:
+        # a box found in it is already in pointmap coordinates.
+        stored_view = seek_mod.ViewGeometry(
+            scale_x=1.0, scale_y=1.0, crop_x0=0, crop_y0=0,
+            out_w=view.out_w, out_h=view.out_h, src_w=view.out_w, src_h=view.out_h,
+        )
+        return self._keyframes.add(seek_mod.Keyframe(
+            image=small,
+            view=stored_view,
+            placement=placement,
+            pointmap=np.asarray(points, dtype=np.float32).copy(),
+            conf=np.asarray(conf, dtype=np.float32).copy(),
+            seq=int(frame.seq),
+            t_ns=placement.t_ns,
+        ))
+
+    def _arm_recall(self, target: str) -> None:
+        """Queue T1's keyframes to be searched for a target named just now.
+
+        This is the half of the mission that cannot be done live: T1 explored
+        without knowing what it would be asked for, so the only place the answer
+        can already exist is in what it saw.  The queue is drained a few frames
+        at a time by :meth:`_run_recall` rather than all at once, because the
+        detector over two hundred keyframes is tens of seconds and the robot is
+        still streaming.
+        """
+        self._recall_target = target
+        self._recall_done = False
+        self._recall_queue = (self._keyframes.newest_first()
+                              if self._keyframes is not None else [])
+        if self._recall_queue:
+            log.info("t2 target %r: searching %d keyframes kept during t1",
+                     target, len(self._recall_queue))
+        else:
+            self._recall_done = True
+
+    def _run_recall(self, target: str, budget: int) -> Optional["seek_mod.Sighting"]:
+        """Search a few stored keyframes.  Returns the first sighting, or None.
+
+        Newest first, and it stops at the first hit rather than ranking every
+        keyframe: a target seen several times during exploration is best
+        described by the most recent sighting, and the robot's own live branch
+        supersedes any of them the moment it sees the thing itself.
+        """
+        cfg = self._seek_cfg
+        queries = detect_mod.queries_from_target(target)
+        for _ in range(max(1, budget)):
+            if not self._recall_queue:
+                self._recall_done = True
+                return None
+            kf = self._recall_queue.pop(0)
+            try:
+                detections = self._detector.detect(kf.image, queries)
+            except Exception:  # noqa: BLE001 - one bad keyframe is not fatal
+                log.exception("detector raised on keyframe seq=%d", kf.seq)
+                continue
+            for det in detections:
+                if det.score < cfg.min_confidence:
+                    continue
+                sighting, _why = seek_mod.locate(
+                    det, kf.pointmap, kf.conf, kf.view, kf.placement, target,
+                    min_conf=cfg.min_point_conf, min_points=cfg.min_points,
+                    depth_band_m=cfg.depth_band_m, keep_frac=cfg.box_keep_frac,
+                    detector=self._detector.name,
+                )
+                if sighting is not None:
+                    sighting.basis = seek_mod.BASIS_MEMORY
+                    log.info("t2 target %r found in a t1 keyframe (seq=%d, %.0fs old) "
+                             "at (%.2f, %.2f, %.2f)",
+                             target, kf.seq, sighting.age_s(), sighting.x,
+                             sighting.y, sighting.z)
+                    self._recall_queue.clear()
+                    self._recall_done = True
+                    return sighting
+        return None
+
+    def _decide(self, frame: Frame, points, conf, pose_c2w) -> Dict[str, Any]:
+        """Watch this frame for the mission target and announce what is known.
+
+        Returns statistics either way, including when it did not run and why —
+        the same argument :meth:`_compare_with_map` makes.  "No detector", "no
+        target named", "t1, so only remembering" and "looked and saw nothing"
+        are four different situations that all produce no ``found``, and three of
+        them are fixable in a minute by whoever is told.
+        """
+        cfg = self._seek_cfg
+        if cfg is None or not cfg.enabled:
+            return {"ran": False, "why": "the decision stage is disabled on the server"}
+        if self._detector is None:
+            return {"ran": False, "why": "no detector loaded; see the startup log"}
+
+        placement = self._placement(frame, pose_c2w)
+        if placement is None:
+            return {"ran": False,
+                    "why": "no pose fresh enough to put a sighting in the map frame"}
+
+        if frame.phase != wire.PHASE_SEEK:
+            # T1: remember, do not decide.  The target is not named yet, and
+            # announcing a found in t1 would reach a robot that is not listening.
+            stored = self._store_keyframe(frame, points, conf, placement)
+            self._prev_phase = frame.phase
+            out: Dict[str, Any] = {
+                "ran": False,
+                "why": "phase is t1: keeping keyframes so a target named at t2 can be "
+                       "looked for in what t1 already saw",
+                "kept_keyframe": stored,
+            }
+            if self._keyframes is not None:
+                out["keyframes"] = self._keyframes.stats()
+            return out
+
+        target = str((frame.mission or {}).get("target", "") or "")
+        if not target:
+            return {"ran": False,
+                    "why": "phase is t2 but no target is named; pass --target on the "
+                           "server or send one in the robot's hello"}
+
+        if self._prev_phase != wire.PHASE_SEEK or self._recall_target != target:
+            self._arm_recall(target)
+        self._prev_phase = wire.PHASE_SEEK
+
+        stats: Dict[str, Any] = {
+            "ran": True,
+            "target": target,
+            "detector": self._detector.name,
+            "open_vocabulary": self._detector.open_vocabulary,
+        }
+
+        # -- the live branch -------------------------------------------------
+        self._seek_runs += 1
+        live: Optional[seek_mod.Sighting] = None
+        # Count from the frame just taken, as deep3r's own every_n does, so the
+        # first frame of t2 runs the detector rather than waiting out a whole
+        # skip cycle before the robot's monitor branch gets anything.
+        if (self._seek_runs - 1) % max(1, cfg.detect_every_n) == 0:
+            live, detect_stats = self._detect_live(frame, points, conf, placement, target)
+            stats.update(detect_stats)
+        else:
+            stats["detected"] = "skipped by seek.detect_every_n"
+
+        # -- the memory branch -----------------------------------------------
+        # Only while the live branch has nothing.  A remembered coordinate is a
+        # claim about the past and the present beats it whenever there is one.
+        recalled: Optional[seek_mod.Sighting] = None
+        if live is None and not self._recall_done:
+            recalled = self._run_recall(target, cfg.recall_budget_per_frame)
+            if recalled is not None:
+                self._memory.remember(recalled)
+        stats["recall_remaining"] = len(self._recall_queue)
+
+        sighting = live or recalled or self._memory.recall(
+            target, map_id=(frame.grid.map_id if frame.grid is not None else ""))
+        if sighting is not None:
+            stats["sighting"] = sighting.as_dict()
+
+        self._maybe_announce(frame, sighting, live is not None, target, stats)
+        if self._keyframes is not None:
+            stats["keyframes"] = self._keyframes.stats()
+        return stats
+
+    def _detect_live(self, frame: Frame, points, conf, placement, target):
+        """Run the detector on this frame and place the best hit in the map."""
+        cfg = self._seek_cfg
+        out: Dict[str, Any] = {}
+        queries = detect_mod.queries_from_target(target)
+        t0 = time.monotonic()
+        try:
+            detections = self._detector.detect(frame.image, queries)
+        except Exception:  # noqa: BLE001 - a detector fault is not a dead session
+            log.exception("detector raised on seq=%d", frame.seq)
+            out["detect_error"] = "the detector raised; see the server log"
+            return None, out
+        out["detect_ms"] = round((time.monotonic() - t0) * 1000.0, 1)
+        out["detections"] = [d.as_dict() for d in detections[:3]]
+
+        for det in detections:
+            if det.score < cfg.min_confidence:
+                out["rejected"] = (f"best score {det.score:.2f} is under "
+                                   f"seek.min_confidence {cfg.min_confidence:.2f}")
+                break
+            sighting, why = seek_mod.locate(
+                det, points, conf, self._view_geometry, placement, target,
+                min_conf=cfg.min_point_conf, min_points=cfg.min_points,
+                depth_band_m=cfg.depth_band_m, keep_frac=cfg.box_keep_frac,
+                detector=self._detector.name,
+            )
+            out["locate"] = why
+            if sighting is not None:
+                self._memory.remember(sighting)
+                self._absent_runs = 0
+                return sighting, out
+        else:
+            if not detections:
+                out["rejected"] = "the detector found nothing in this frame"
+
+        self._absent_runs += 1
+        out["absent_runs"] = self._absent_runs
+        return None, out
+
+    def _maybe_announce(self, frame: Frame, sighting, is_live: bool,
+                        target: str, stats: Dict[str, Any]) -> None:
+        """Decide whether this frame's knowledge is worth a message.
+
+        The robot *acts* on a found — it stops what it is doing and drives — so
+        the rate limit here is generous where the map updates' is tight.  Three
+        things override it, and each is genuinely news: the first announcement of
+        a mission, a target that has moved further than the robot's own position
+        error, and a coordinate whose basis has changed from remembered to seen.
+        """
+        cfg = self._seek_cfg
+        now = wire.monotonic_ns()
+
+        if sighting is None:
+            # "I have looked and it is not here" is a message, and it is what
+            # lets the robot stop waiting on the monitor branch and start
+            # searching.  Sent once per absence rather than repeatedly.
+            if cfg.absent_after_runs and self._absent_runs >= cfg.absent_after_runs:
+                self._absent_runs = 0
+                self._last_announced = None
+                frame.announce(wire.found(
+                    seq=0, target=target, found=False, confidence=0.0,
+                    frame=(frame.grid.frame if frame.grid is not None else "map"),
+                    map_id=(frame.grid.map_id if frame.grid is not None else ""),
+                    basis="absent",
+                    decider=self._detector.name,
+                    rationale=(f"{cfg.absent_after_runs} consecutive detector runs with "
+                               "no sighting, and nothing remembered from t1"),
+                    reachable=None,
+                    evidence={"absent_runs": cfg.absent_after_runs,
+                              "recall_exhausted": self._recall_done},
+                ))
+                stats["announced"] = "absent"
+            return
+
+        previous = self._last_announced
+        elapsed_ms = (now - self._last_found_ns) / 1e6 if self._last_found_ns else 1e9
+        moved = (math.hypot(sighting.x - previous.x, sighting.y - previous.y)
+                 if previous is not None else float("inf"))
+        basis_changed = previous is not None and previous.basis != sighting.basis
+        if not (elapsed_ms >= cfg.min_found_interval_ms
+                or moved >= cfg.resend_move_m
+                or basis_changed):
+            stats["announced"] = "suppressed by seek.min_found_interval_ms"
+            return
+
+        reach = seek_mod.judge_reach(
+            sighting, self._envelope, frame.grid,
+            from_xy=(frame.odom.x, frame.odom.y) if frame.odom is not None else None,
+        )
+        stats["reach"] = reach.as_dict()
+
+        approach = reach.approach
+        yaw = approach[2] if approach is not None else sighting.bearing_rad
+        frame.announce(wire.found(
+            seq=0, target=target, found=True,
+            confidence=sighting.confidence,
+            x=sighting.x, y=sighting.y, z=sighting.z, yaw=yaw,
+            approach=approach,
+            frame=sighting.frame, map_id=sighting.map_id,
+            basis=sighting.basis, age_s=sighting.age_s(now),
+            reachable=reach.reachable, reach=reach.as_dict(),
+            decider=self._detector.name,
+            rationale=(f"{'seen now' if is_live else 'seen during t1'}; "
+                       f"{sighting.points} cloud points at {sighting.range_m:.2f} m; "
+                       f"{reach.reason}"),
+            evidence={"box": list(sighting.box), "points": sighting.points,
+                      "range_m": round(sighting.range_m, 3),
+                      "spread_m": round(sighting.spread_m, 3),
+                      "query": sighting.query,
+                      "cloud_map_id": self._map_id,
+                      "from_frame_seq": int(frame.seq)},
+        ))
+        self._last_found_ns = now
+        self._last_announced = sighting
+        stats["announced"] = sighting.basis
 
     # -- the Compare box -----------------------------------------------------
 
@@ -518,7 +928,8 @@ class Deep3RProcessor(Processor):
             W, H = img.size
             cx, cy = W // 2, H // 2
             half = min(cx, cy)
-            img = img.crop((cx - half, cy - half, cx + half, cy + half))
+            crop_x0, crop_y0 = cx - half, cy - half
+            img = img.crop((crop_x0, crop_y0, cx + half, cy + half))
         else:
             img = self._resize_pil(img, self.size)
             W, H = img.size
@@ -526,7 +937,21 @@ class Deep3RProcessor(Processor):
             halfw, halfh = ((2 * cx) // 16) * 8, ((2 * cy) // 16) * 8
             if W == H:
                 halfh = int(3 * halfw / 4)
-            img = img.crop((cx - halfw, cy - halfh, cx + halfw, cy + halfh))
+            crop_x0, crop_y0 = cx - halfw, cy - halfh
+            img = img.crop((crop_x0, crop_y0, cx + halfw, cy + halfh))
+
+        # Record what was actually done to the frame.  A detector box is in the
+        # source frame's pixels and the points behind it are indexed in the
+        # pointmap's, and getting that mapping wrong does not raise -- it reads
+        # the depth of whatever is a few centimetres to the side, which is a
+        # coordinate that looks entirely plausible and is not the object.
+        W2, H2 = img.size
+        self._view_geometry = seek_mod.ViewGeometry(
+            scale_x=(W / W1) if W1 else 1.0,
+            scale_y=(H / H1) if H1 else 1.0,
+            crop_x0=crop_x0, crop_y0=crop_y0,
+            out_w=W2, out_h=H2, src_w=W1, src_h=H1,
+        )
 
         tensor = self._img_norm(img)[None]
         return {

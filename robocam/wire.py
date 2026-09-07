@@ -1069,6 +1069,10 @@ def found(
     phase: str = PHASE_SEEK,
     decider: str = "",
     rationale: str = "",
+    basis: str = "live",
+    age_s: float = 0.0,
+    reachable: bool | None = None,
+    reach: Dict[str, Any] | None = None,
     evidence: Dict[str, Any] | None = None,
     data: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
@@ -1084,6 +1088,22 @@ def found(
     ``found: false`` is a real and useful message — the decision stage having
     looked and concluded the target is not here is what lets the robot stop
     waiting and pick another exit, rather than seeking until it times out.
+
+    ``basis`` says how the coordinate was arrived at, and the robot's two search
+    branches are exactly its two values:
+
+    ``live``    the decision stage is looking at the target in this frame.  Drive
+                to it; it is there now.
+    ``memory``  the target was seen earlier — usually in T1, before it was named
+                — and this is where it was, ``age_s`` seconds ago.  Drive there,
+                keep watching, and expect to have to search if it has moved.
+
+    ``reachable`` is a three-valued answer and the third value carries weight.
+    True and False are the gripper envelope; ``null`` means the height could not
+    be measured for this coordinate, and the robot's correct response is to go
+    and look rather than to assume either.  ``reach.verdict`` says which case it
+    is in one word — see :mod:`robocam.seek` — and ``reach.reason`` says it in a
+    sentence, for the log.
 
     ``rationale`` is free text from whatever made the decision.  It is for the
     log and for the human reading it afterwards; nothing on the robot should
@@ -1102,6 +1122,14 @@ def found(
         "y": round(float(y), 4),
         "z": round(float(z), 4),
         "yaw": round(float(yaw), 5),
+        "basis": str(basis),
+        "age_s": round(float(age_s), 2),
+        # Explicitly three-valued: None survives JSON as null, and a robot that
+        # tests `if header["reachable"]` treats it as "no" while one that tests
+        # `is False` treats it as "go and look".  The docstring says which is
+        # meant; collapsing it to a bool here would remove the choice.
+        "reachable": None if reachable is None else bool(reachable),
+        "reach": reach or {},
         "decider": decider,
         "rationale": rationale,
         "evidence": evidence or {},

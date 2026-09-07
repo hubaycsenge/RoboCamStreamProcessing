@@ -269,6 +269,102 @@ mission:
   # driving into it.
   approach_standoff_m: 0.8
 
+  # --- when is T1 finished? ---
+  # Evaluated on every uploaded grid and reported in the map reply as
+  # data.t1_exit. The server never changes phase on its own: the transition is a
+  # decision about the mission, and leaving it with whoever runs the mission is
+  # also what lets you end T1 early for a demo.
+  #
+  # Four tests, and no one of them is enough alone:
+  #   explored       necessary, and never sufficient -- the grid is a rectangle
+  #                  and rooms are not, so some of it is always behind a wall.
+  #   no_open_exits  the decisive one, and the robot's judgement rather than the
+  #                  server's, because the robot knows which frontiers it tried.
+  #   not_growing    catches the honest end of a closed room, where the explored
+  #                  fraction plateaus below any threshold and stays there.
+  #   placed         T1's product is the CLOUD, not the grid. Finishing with a
+  #                  good map and a cloud that was never correctly placed leaves
+  #                  T2 nothing to search, and that surfaces an hour later as
+  #                  "the detector never sees anything".
+  t1_exit_report: true
+  t1_min_explored: 0.80
+  t1_max_open_exits: 0
+  t1_stall_cells_per_s: 15.0
+  t1_min_stall_window_s: 30.0
+  t1_min_agreement: 0.15
+  t1_min_frames: 300
+  t1_min_runtime_s: 60.0
+
+seek:
+  # The decision stage: the LLM/decision-making box of the diagram. Runs in t2,
+  # watches the same frames the reconstruction does, and announces "found" with
+  # a map-frame coordinate, an approach pose and a reachability verdict.
+  #
+  # Split from "mission" on purpose. mission is what this RUN is about and
+  # changes per run; this is what the robot and its detector ARE, and changes
+  # when the hardware does.
+  enabled: true
+
+  # --- the detector ---
+  # colour -> no weights: matches the colour word in the target text and finds
+  #           the largest blob of it. It cannot tell a red mug from a red
+  #           jumper, and that is fine -- it exists so the geometry after the
+  #           box (cloud lookup, map transform, reachability, the wire) can be
+  #           run end to end without a checkpoint, exactly as "stats" keeps the
+  #           transport checkable without a model.
+  # owl    -> OWLv2 through transformers: real open-vocabulary detection with
+  #           the target text as the query. The one that actually seeks.
+  #           Downloads weights on first use and wants its own slice of GPU.
+  # none   -> finds nothing; measures what T2 costs without the detector.
+  detector: colour
+  detector_options: {}
+  #   model: google/owlv2-base-patch16-ensemble
+  #   device: cuda:0        # shares the card with CUT3R by default
+  #   score_min: 0.08       # the detector's floor, not the mission's threshold
+
+  # Run the detector on one frame in N. It is the expensive half of T2 and the
+  # target does not move at the frame rate.
+  detect_every_n: 2
+
+  # --- believing a detection ---
+  min_confidence: 0.25      # score below which a detection is not acted on
+  min_points: 8             # cloud points behind the box before a coordinate counts
+  min_point_conf: 1.5       # CUT3R conf_self gate inside the box (scale starts at 1.0)
+  depth_band_m: 0.25        # kept around the box's median range: stops the wall
+                            # behind an object dragging its coordinate backwards
+  box_keep_frac: 0.7        # sample the middle of the box; its corners are background
+
+  # --- announcing ---
+  min_found_interval_ms: 1000.0   # the robot ACTS on a found; do not stream them
+  absent_after_runs: 30     # consecutive empty detector runs before "found: false",
+                            # which is what lets the robot start searching rather
+                            # than seeking until it times out. 0 disables.
+  resend_move_m: 0.35       # a target that has actually moved is news
+
+  # --- the gripper: tape-measure facts about YOUR robot ---
+  # THE number to get right. The Mecanumbot's gripper closes at floor level, so
+  # an object higher than this cannot be picked up however close it drives.
+  # Knowing that BEFORE driving is the whole value of having a reconstruction:
+  # the LiDAR sees one horizontal plane and cannot tell the floor from the table.
+  grasp_z_max: 0.12
+  grasp_z_min: -0.05        # below the floor plane is a reconstruction error
+  reach_radius_m: 0.45      # how far from the base centre the gripper closes
+  robot_radius_m: 0.22      # footprint, for deciding if a standing cell is clear
+
+  # --- remembering T1 ---
+  # T1 explores without knowing what it will be asked for; the target is named
+  # at T2 launch. So T1 keeps keyframes -- the image, and the transform that
+  # puts that image's cloud in the map frame -- and at T2 launch the newly named
+  # target is searched for in what T1 already saw. A hit gives the robot a goal
+  # coordinate before T2 has taken a single frame, which is the "go to where you
+  # last saw it" branch of the behaviour tree.
+  keyframes: true
+  keyframe_max: 240
+  keyframe_spacing_m: 0.25    # thinned by distance, not time: a parked robot
+  keyframe_spacing_rad: 0.35  # produces sixty identical frames and no evidence
+  recall_budget_per_frame: 3  # spread the retro-search so it never stalls the stream
+  memory_ttl_s: 900.0
+
 snapshot:
   # Periodically write a decoded frame to disk so you can confirm from your
   # laptop, over the sshfs mount, that real images are arriving.

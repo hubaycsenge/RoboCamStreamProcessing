@@ -52,7 +52,9 @@ import zmq
 
 from . import imu as imu_mod
 from . import lidar as lidar_mod
+from . import detect as detect_mod
 from . import mission as mission_mod
+from . import seek as seek_mod
 from . import occupancy as occupancy_mod
 from . import odometry as odom_mod
 from . import processors, wire
@@ -151,6 +153,21 @@ class Session:
     phase: str = wire.PHASE_EXPLORE
     mission: Dict[str, Any] = field(default_factory=dict)
 
+    # -- is T1 finished? ---------------------------------------------------
+    # How fast the map is still gaining observed cells.  Held per session
+    # because it is a property of this robot's run, and sampled on every
+    # uploaded grid rather than on a timer, so a robot that stops uploading
+    # stops contributing evidence rather than appearing to have finished.
+    coverage: seek_mod.CoverageTracker = field(
+        default_factory=lambda: seek_mod.CoverageTracker(window_s=30.0))
+    # Running mean of the comparison's agreement.  T1's product is the cloud,
+    # and a cloud that never agreed with the grid is one T2 cannot search.
+    agreement_sum: float = 0.0
+    agreement_n: int = 0
+    # Latched so that "t1 looks finished" is logged once rather than on every
+    # grid for the rest of the run.
+    t1_ready_logged: bool = False
+
     # -- the server's own outgoing streams --------------------------------
     # Sequence numbers for the three announcements.  Per session and owned
     # here, so that two workers cannot allocate the same one.
@@ -165,6 +182,16 @@ class Session:
     map_updates_sent: int = 0
     pose_hints_sent: int = 0
     founds_sent: int = 0
+
+    @property
+    def mean_agreement(self) -> Optional[float]:
+        """Mean cloud/grid agreement so far, or None if none was ever measured.
+
+        None and 0.0 are different answers and the distinction matters: never
+        having compared is a configuration problem, and having compared and
+        agreed with nothing is a placement problem.
+        """
+        return (self.agreement_sum / self.agreement_n) if self.agreement_n else None
 
     def touch(self) -> None:
         self.last_seen_ns = wire.monotonic_ns()
@@ -334,6 +361,31 @@ class StreamServer:
             self.cfg.mission.phase,
             f" | target={self.cfg.mission.target!r}" if self.cfg.mission.target else "",
         )
+        log.info(
+            "  seek=%s | t1 exit report=%s",
+            (
+                f"on (detector {self.cfg.seek.detector}, 1 frame in "
+                f"{self.cfg.seek.detect_every_n}, grasp below "
+                f"{self.cfg.seek.grasp_z_max:.2f} m, "
+                f"keyframes {'on' if self.cfg.seek.keyframes else 'off'})"
+                if self.cfg.seek.enabled else "off"
+            ),
+            (
+                f"on (explored >{self.cfg.mission.t1_min_explored:.0%}, "
+                f"agreement >{self.cfg.mission.t1_min_agreement:.2f})"
+                if self.cfg.mission.t1_exit_report else "off"
+            ),
+        )
+        if (self.cfg.seek.enabled and self.cfg.mission.phase == wire.PHASE_SEEK
+                and not self.cfg.mission.target):
+            # Worth saying at startup rather than at the first t2 frame: a
+            # server started straight into t2 with no target looks like it is
+            # working and never announces anything.
+            log.warning(
+                "starting in t2 with no target named. The decision stage will not "
+                "search until one arrives -- pass --target, or send one in the "
+                "robot's hello."
+            )
         # These are addresses on *this* node, for a benchmark client running
         # here. They are deliberately not labelled as somewhere the robot can
         # dial: the robot is behind the lab router's NAT and reaches the server
@@ -583,6 +635,26 @@ class StreamServer:
                         "target": session.mission.get("target", ""),
                         "rank_exits": self.cfg.mission.rank_exits,
                         "phases": list(wire.SUPPORTED_PHASES),
+                    },
+                    # Whether a `found` can ever arrive, and what it will mean.
+                    # A robot whose seek behaviour tree waits on a monitor branch
+                    # that no server is feeding waits forever and looks like it
+                    # is searching, so this is worth stating before t2 rather
+                    # than being inferred from silence.
+                    "seek": {
+                        "enabled": self.cfg.seek.enabled,
+                        "detector": self.cfg.seek.detector if self.cfg.seek.enabled else "",
+                        # The gripper envelope the `reachable` verdict is judged
+                        # against, so the robot can explain a "too_high" without
+                        # holding a second copy of a number that could disagree.
+                        "grasp_z": [self.cfg.seek.grasp_z_min, self.cfg.seek.grasp_z_max],
+                        "standoff_m": self.cfg.mission.approach_standoff_m,
+                        # Announcing `found: false` after looking is what lets the
+                        # robot stop waiting and start searching; a robot told
+                        # this is 0 knows not to wait for one.
+                        "absent_after_runs": self.cfg.seek.absent_after_runs,
+                        "keyframes": self.cfg.seek.keyframes,
+                        "basis": ["live", "memory", "absent"],
                     },
                 },
                 echo_t_send_ns=header.get("t_send_ns"),
@@ -1085,6 +1157,10 @@ class StreamServer:
                 else f"pose is in {pose.frame!r}, grid is in {held.frame!r}"
             )
 
+        verdict = self._evaluate_t1(session, held)
+        if verdict is not None:
+            data["t1_exit"] = verdict
+
         log.info(
             "session %s: map seq=%d %dx%d @%.3f m/cell, %.0f%% explored, "
             "%d occupied (%.1f kB on the wire, %.1f ms)",
@@ -1104,6 +1180,81 @@ class StreamServer:
             t_capture_ns=header.get("t_capture_ns"),
             t_send_ns=header.get("t_send_ns"),
         ))
+
+    # -- is T1 finished? --------------------------------------------------
+
+    def _note_agreement(self, session: Session, data: Dict[str, Any]) -> None:
+        """Accumulate the comparison's health number off each frame's result.
+
+        Read out of the processor's own payload rather than recomputed, because
+        the comparison is the processor's product and a second implementation
+        here could disagree with it.  Only comparisons that actually ran count:
+        a frame with no grid or no pose produced no evidence about placement, and
+        averaging its absence in as a zero would make a session that started
+        before the robot's map arrived look permanently misplaced.
+        """
+        comp = data.get("compare") if isinstance(data, dict) else None
+        if not isinstance(comp, dict) or not comp.get("placed"):
+            return
+        agreement = comp.get("agreement")
+        if agreement is None:
+            return
+        session.agreement_sum += float(agreement)
+        session.agreement_n += 1
+
+    def _evaluate_t1(self, session: Session, grid: occupancy_mod.Grid) -> Optional[Dict[str, Any]]:
+        """Answer "is the first scan finished?" and say what is still missing.
+
+        A **recommendation**, never an action.  The server does not change phase
+        on its own, for the same reason it does not decide which exit to drive
+        to: the transition between exploring and seeking is a decision about the
+        mission, whoever is running the mission owns it, and a server that
+        switched by itself would also have to be argued with to end T1 early for
+        a demo.  What it can do is measure the four things the robot cannot see
+        from where it stands — how much of its own grid it has observed, whether
+        that number is still moving, how many frontiers it still calls open, and
+        whether the reconstruction it has been building is placed where the map
+        is — and hand back the verdict with every test that produced it.
+        """
+        if not self.cfg.mission.t1_exit_report:
+            return None
+
+        session.coverage.observe(grid.size - int(grid.summary.get("unknown", 0)))
+        criteria = seek_mod.T1Criteria(
+            min_explored=self.cfg.mission.t1_min_explored,
+            max_open_exits=self.cfg.mission.t1_max_open_exits,
+            stall_cells_per_s=self.cfg.mission.t1_stall_cells_per_s,
+            min_stall_window_s=self.cfg.mission.t1_min_stall_window_s,
+            min_agreement=self.cfg.mission.t1_min_agreement,
+            min_frames=self.cfg.mission.t1_min_frames,
+            min_runtime_s=self.cfg.mission.t1_min_runtime_s,
+        )
+        verdict = seek_mod.t1_exit_criteria(
+            grid, session.exits,
+            criteria=criteria,
+            coverage=session.coverage,
+            mean_agreement=session.mean_agreement,
+            frames=session.frames_processed,
+            runtime_s=session.age_s(),
+            min_exit_width_m=self.cfg.mission.min_exit_width_m,
+        )
+        if verdict["ready"] and session.phase == wire.PHASE_EXPLORE and not session.t1_ready_logged:
+            session.t1_ready_logged = True
+            log.info(
+                "session %s: t1 looks finished -- %.0f%% explored, %d open exits, "
+                "growth %s cells/s, agreement %s. Switch to t2 with a target when "
+                "ready; this server will not switch on its own.",
+                session.session_id,
+                100.0 * verdict["tests"].get("explored_fraction", 0.0),
+                verdict["tests"].get("open_exits", 0),
+                verdict["tests"].get("growth_cells_per_s"),
+                verdict["tests"].get("mean_agreement"),
+            )
+        elif not verdict["ready"]:
+            # Un-latch, so a map that grows again after a plateau reports the
+            # completion a second time rather than staying silent about it.
+            session.t1_ready_logged = False
+        return verdict
 
     # -- exits path -------------------------------------------------------
 
@@ -1213,6 +1364,7 @@ class StreamServer:
             # Client disconnected while its frame was in flight.
             return
         session.frames_processed += 1
+        self._note_agreement(session, item.data)
 
         # The processor's own products go first, so a robot acting on the result
         # already holds whatever they carried.
@@ -1613,7 +1765,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--phase", choices=list(wire.SUPPORTED_PHASES), default=None,
                    help="phase for sessions that do not declare one: t1 explore, t2 seek")
     p.add_argument("--target", default=None,
-                   help="mission target for t2, for a client that does not send one")
+                   help="what t2 is looking for, in words. Free text: it is the query "
+                        "the detector is given, so 'the red mug on the desk' beats "
+                        "'mug'. Naming one here is how a mission is started at launch "
+                        "time; a target in the robot's hello wins over it.")
+    p.add_argument("--detector", default=None,
+                   help=f"override seek.detector: {', '.join(detect_mod.available())}. "
+                        "'colour' needs no weights and matches a colour word in the "
+                        "target; 'owl' is open-vocabulary and is the one that seeks.")
+    p.add_argument("--no-seek", action="store_true",
+                   help="disable the decision stage. t2 then navigates without a target "
+                        "search, which is what you want while fitting the detector.")
+    p.add_argument("--grasp-height", type=float, default=None,
+                   help="override seek.grasp_z_max, metres above the floor: the top of "
+                        "the gripper's envelope. Anything higher is reported unreachable.")
+    p.add_argument("--no-t1-report", action="store_true",
+                   help="stop evaluating whether t1 is finished (mission.t1_exit_report)")
     p.add_argument("--mount-yaw", type=float, default=None,
                    help="override lidar.mount_yaw_deg: bearing the camera looks along")
     p.add_argument("--hfov", type=float, default=None,
@@ -1667,6 +1834,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg.mission.phase = args.phase
     if args.target is not None:
         cfg.mission.target = args.target
+    if args.detector is not None:
+        if args.detector not in detect_mod.available():
+            parser_error = (f"unknown detector {args.detector!r}; "
+                            f"available: {', '.join(detect_mod.available())}")
+            print(parser_error, file=sys.stderr)
+            return 2
+        cfg.seek.detector = args.detector
+    if args.no_seek:
+        cfg.seek.enabled = False
+    if args.grasp_height is not None:
+        cfg.seek.grasp_z_max = args.grasp_height
+    if args.no_t1_report:
+        cfg.mission.t1_exit_report = False
     if args.mount_yaw is not None:
         cfg.lidar.mount_yaw_deg = args.mount_yaw
     if args.hfov is not None:

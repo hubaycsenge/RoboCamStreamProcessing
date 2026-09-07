@@ -37,6 +37,14 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 echo ">>> uv $(uv --version)"
 
+# Existence is not enough: a venv built on another node has a dangling
+# interpreter symlink here (see the note above), and uv refuses to install into
+# it. Probe the interpreter and rebuild from scratch if it does not run.
+if [[ -d .venv ]] && ! ./.venv/bin/python -c '' >/dev/null 2>&1; then
+    echo ">>> .venv has a broken interpreter (built on another node?), removing it"
+    rm -rf .venv
+fi
+
 if [[ ! -d .venv ]]; then
     echo ">>> creating .venv with Python ${PYTHON_VERSION}"
     uv venv --python "${PYTHON_VERSION}" .venv

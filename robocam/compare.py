@@ -121,23 +121,31 @@ class CompareResult:
         return bool(self.stats.get("placed"))
 
 
-def cloud_to_map(points: np.ndarray, pose_c2w: np.ndarray, odom: Odom,
-                 mount: CameraMount) -> np.ndarray:
-    """Transform a cloud from the model's world frame into the robot's map frame.
+def invert_rigid(matrix: np.ndarray) -> np.ndarray:
+    """Inverse of a 4x4 rigid transform, by transpose and negate.
 
-    ``points`` is (N, 3) in the reconstruction's world frame; ``pose_c2w`` is the
-    4x4 camera-to-that-world pose the model returned for the same frame.  The
-    composition is the one in the module docstring, and the inverse is taken with
-    an explicit transpose-and-negate rather than ``np.linalg.inv`` because a
-    rigid transform's inverse is exact that way and a general inversion of a
-    nearly-singular matrix is not.
+    Not ``np.linalg.inv``: for a rotation the transpose *is* the inverse and is
+    exact, while a general inversion of a nearly-singular matrix is neither.
     """
-    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
-    if points.size == 0:
-        return points
+    matrix = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
+    rot, t = matrix[:3, :3], matrix[:3, 3]
+    out = np.eye(4)
+    out[:3, :3] = rot.T
+    out[:3, 3] = -rot.T @ t
+    return out
 
+
+def map_from_cloud_matrix(pose_c2w: np.ndarray, odom: Odom,
+                          mount: CameraMount) -> np.ndarray:
+    """``T_map_cloud``: the 4x4 that takes the model's world frame to the map frame.
+
+    The composition from the module docstring, in one place so that the two
+    directions cannot drift apart.  Both :func:`cloud_to_map` and
+    :func:`map_to_cloud` are this matrix and its inverse, which is what makes
+    "the coordinate I sent the robot, taken back to the cloud" round-trip
+    exactly rather than approximately.
+    """
     pose_c2w = np.asarray(pose_c2w, dtype=np.float64).reshape(4, 4)
-    rot_c2w, t_c2w = pose_c2w[:3, :3], pose_c2w[:3, 3]
 
     # T_map_base: the robot's planar pose, lifted to 3D.  The robot drives on a
     # floor, so roll and pitch of the base are zero by construction here; if that
@@ -149,10 +157,46 @@ def cloud_to_map(points: np.ndarray, pose_c2w: np.ndarray, odom: Odom,
     t_map_base[:3, 3] = (odom.x, odom.y, odom.z)
 
     t_map_cam = t_map_base @ mount.matrix()
+    return t_map_cam @ invert_rigid(pose_c2w)
 
-    # points_cam = R_c2w^T (points_world - t_c2w), then into the map.
-    local = (points - t_c2w) @ rot_c2w
-    return local @ t_map_cam[:3, :3].T + t_map_cam[:3, 3]
+
+def _apply(matrix: np.ndarray, points: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if points.size == 0:
+        return points
+    return points @ matrix[:3, :3].T + matrix[:3, 3]
+
+
+def cloud_to_map(points: np.ndarray, pose_c2w: np.ndarray, odom: Odom,
+                 mount: CameraMount) -> np.ndarray:
+    """Transform a cloud from the model's world frame into the robot's map frame.
+
+    ``points`` is (N, 3) in the reconstruction's world frame; ``pose_c2w`` is the
+    4x4 camera-to-that-world pose the model returned for the same frame.  This is
+    the direction everything in T1 uses: the reconstruction is produced in the
+    model's frame and has to be compared against a grid drawn in the robot's.
+    """
+    return _apply(map_from_cloud_matrix(pose_c2w, odom, mount), points)
+
+
+def map_to_cloud(points_map: np.ndarray, pose_c2w: np.ndarray, odom: Odom,
+                 mount: CameraMount) -> np.ndarray:
+    """The other direction: a map-frame coordinate back into the model's world frame.
+
+    T2 needs this and T1 does not, which is why it arrived second.  Once the
+    robot has been told "the mug is at (3.2, 1.4) in the map", every subsequent
+    question about that place — is there still something there, what does the
+    current cloud say about its height — is a question about a region of the
+    *cloud*, and the coordinate has to travel back across the same transform it
+    came out of.
+
+    The caveat that matters: ``pose_c2w`` anchors this to one reconstruction
+    state.  CUT3R's world frame is reset whenever ``map_id`` changes, so a
+    coordinate carried back with a pose from a different ``map_id`` lands
+    somewhere arbitrary.  Callers hold the ``map_id`` alongside the matrix for
+    exactly this reason; see :class:`robocam.seek.Placement`.
+    """
+    return _apply(invert_rigid(map_from_cloud_matrix(pose_c2w, odom, mount)), points_map)
 
 
 def occupancy_from_cloud(

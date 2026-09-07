@@ -49,3 +49,27 @@ def test_shipped_config_parses():
     path = Path(__file__).resolve().parent.parent / "config" / "server.yaml"
     cfg = Config.load(path)
     assert cfg.processor.name in ("stats", "noop")
+
+
+def test_the_seek_section_loads():
+    cfg = Config.from_dict({"seek": {"detector": "owl", "grasp_z_max": 0.2}})
+    assert cfg.seek.detector == "owl"
+    assert cfg.seek.grasp_z_max == 0.2
+    assert cfg.seek.enabled is True
+
+
+def test_an_inverted_gripper_envelope_is_refused():
+    """As written the envelope is empty and nothing would ever be reachable —
+    which looks exactly like a detector that never finds anything."""
+    with pytest.raises(ConfigError, match="grasp_z_max"):
+        Config.from_dict({"seek": {"grasp_z_max": 0.0, "grasp_z_min": 0.5}})
+
+
+def test_a_typo_in_the_seek_section_is_an_error_like_any_other():
+    with pytest.raises(ConfigError, match="unknown key"):
+        Config.from_dict({"seek": {"grasp_z_maks": 0.2}})
+
+
+def test_the_t1_thresholds_are_bounded():
+    with pytest.raises(ConfigError, match="t1_min_explored"):
+        Config.from_dict({"mission": {"t1_min_explored": 1.4}})
