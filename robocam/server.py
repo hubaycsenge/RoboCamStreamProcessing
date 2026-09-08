@@ -174,14 +174,17 @@ class Session:
     map_update_seq: int = 0
     pose_hint_seq: int = 0
     found_seq: int = 0
+    agreement_seq: int = 0
     # When each was last sent, for the rate limits in config.  A costmap that
     # is rewritten at the reconstruction's rate costs the robot more than the
     # updates are worth.
     last_map_update_ns: int = 0
+    last_agreement_ns: int = 0
     last_pose_hint_ns: int = 0
     map_updates_sent: int = 0
     pose_hints_sent: int = 0
     founds_sent: int = 0
+    agreements_sent: int = 0
 
     @property
     def mean_agreement(self) -> Optional[float]:
@@ -704,7 +707,7 @@ class StreamServer:
                 "session %s closed | %d frames, %d dropped, %d failed, "
                 "%d scans (%d bad), %d imu samples (%d bad bursts), "
                 "%d poses (%d bad), %d maps (%d bad), "
-                "%d patches / %d hints / %d found sent | %.1f MB, %.0fs",
+                "%d patches / %d hints / %d found / %d verdicts sent | %.1f MB, %.0fs",
                 session.session_id,
                 session.frames_received,
                 session.frames_dropped,
@@ -720,6 +723,7 @@ class StreamServer:
                 session.map_updates_sent,
                 session.pose_hints_sent,
                 session.founds_sent,
+                session.agreements_sent,
                 session.bytes_received / 1e6,
                 session.age_s(),
             )
@@ -1471,6 +1475,22 @@ class StreamServer:
                          "from %d inliers -- advisory, %s",
                          session.session_id, header.get("dx", 0.0), header.get("dy", 0.0),
                          header.get("inliers", 0), header.get("method", "?"))
+
+            elif mtype == wire.MSG_AGREEMENT:
+                if not (self.cfg.compare.enabled and self.cfg.compare.send_agreement):
+                    continue
+                if current_map_id is not None and header.get("map_id") != current_map_id:
+                    log.info("session %s: dropping agreement for map_id %r; robot is on %r",
+                             session.session_id, header.get("map_id"), current_map_id)
+                    continue
+                interval_ms = (now - session.last_agreement_ns) / 1e6
+                if (session.last_agreement_ns
+                        and interval_ms < self.cfg.compare.min_agreement_interval_ms):
+                    continue
+                header["seq"] = session.agreement_seq
+                session.agreement_seq += 1
+                session.last_agreement_ns = now
+                session.agreements_sent += 1
 
             elif mtype == wire.MSG_FOUND:
                 # Not rate-limited and not gated: this is the end of the mission,

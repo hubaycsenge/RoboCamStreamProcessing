@@ -286,6 +286,27 @@ class CompareConfig:
     # has not had time to apply is a correction that will be measured again.
     min_hint_interval_ms: float = 2000.0
 
+    # --- the agreement verdict (the `agreement` announcement) ---
+    # Send it at all.  Off means the comparison still runs and is logged, but
+    # the robot never hears the verdict -- which also means its T1 `CLOUD` exit
+    # criterion can never be satisfied.  See docs/INTEGRATION.md.
+    send_agreement: bool = True
+    # One verdict per this many milliseconds.  The reconstruction runs at ~6 Hz;
+    # the robot's exploration decides things at walking pace, and a verdict it
+    # has not acted on yet is one that will be measured again.
+    min_agreement_interval_ms: float = 1000.0
+    # Side of the square the disagreement is pooled into before clustering, in
+    # metres.  Regions are places to drive to, so this is roughly the smallest
+    # thing worth a detour; below about 0.3 m the list fills with reconstruction
+    # noise and the robot spends T1 visiting specks.
+    region_block_m: float = 0.5
+    # Disagreeing cells a block needs before it counts.  The same speck filter
+    # `min_new_cells` applies to the patch, at block scale.
+    region_min_cells: int = 3
+    # Cap on the region list.  It rides in an announcement on the same socket as
+    # the frames, and the lowest-scoring are what the cap drops.
+    max_regions: int = 32
+
     def __post_init__(self) -> None:
         if self.z_min >= self.z_max:
             raise ConfigError("compare.z_min must be below compare.z_max")
@@ -293,6 +314,12 @@ class CompareConfig:
             raise ConfigError("compare.min_points must be >= 1")
         if self.search_cells < 0:
             raise ConfigError("compare.search_cells must be >= 0")
+        if self.region_block_m <= 0.0:
+            raise ConfigError("compare.region_block_m must be > 0")
+        if self.region_min_cells < 1:
+            raise ConfigError("compare.region_min_cells must be >= 1")
+        if self.max_regions < 0:
+            raise ConfigError("compare.max_regions must be >= 0")
 
 
 @dataclass
@@ -429,13 +456,26 @@ class SeekConfig:
     # so an object higher than this is not collectable however close it drives.
     # Knowing that before driving is the whole value of having a reconstruction
     # rather than a scanner, which cannot tell the floor from the table at all.
-    grasp_z_max: float = 0.12
+    #
+    # These two are SHARED WITH THE ROBOT and must match
+    # `seek_grasp_height_min` / `_max` in mecanumbot_seek's constants file. The
+    # shafts sit at z ~ 0.034 with a 0.116 m clear gap and there is no lift DOF,
+    # which is where both numbers come from. They disagreed until 2026-09-08.
+    grasp_z_max: float = 0.15
+    # Bottom of the same gap: above the floor but under the shafts is a real
+    # object in a recess, reported as `too_low`.
+    grasp_z_min: float = 0.03
     # Below the map's floor plane is a reconstruction error, not an object.
-    # Slightly negative because the floor plane is a plane and a real floor is not.
-    grasp_z_min: float = -0.05
+    # Slightly negative because the floor plane is a plane and a real floor is
+    # not. NOT the bottom of the grasp band -- these were one field, and
+    # conflating "the model produced a point in the basement" with "the mug is
+    # in a recess" loses the difference between a bug and something to tell a
+    # person about.
+    floor_tolerance_m: float = -0.05
     # How far from the base centre the gripper closes.  Used to ask whether any
-    # standing position puts the object in range.
-    reach_radius_m: float = 0.45
+    # standing position puts the object in range. Matches `seek_grasp_distance`
+    # on the robot, which is where the tree actually attempts a grasp.
+    reach_radius_m: float = 0.30
     # Footprint radius, for deciding whether a candidate standing cell is clear.
     # The Mecanumbot is 28 cm across the wheels; this is that plus a margin.
     robot_radius_m: float = 0.22
@@ -468,6 +508,13 @@ class SeekConfig:
                 f"seek.grasp_z_max ({self.grasp_z_max}) must be above grasp_z_min "
                 f"({self.grasp_z_min}); as written the gripper envelope is empty and "
                 "nothing would ever be reachable"
+            )
+        if self.floor_tolerance_m > self.grasp_z_min:
+            raise ConfigError(
+                f"seek.floor_tolerance_m ({self.floor_tolerance_m}) must be at or "
+                f"below grasp_z_min ({self.grasp_z_min}); above it, an object in a "
+                "recess is reported as a reconstruction error instead of as "
+                "something to tell a person about"
             )
         if self.min_points < 1:
             raise ConfigError("seek.min_points must be >= 1")

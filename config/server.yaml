@@ -267,13 +267,29 @@ mission:
   # How far short of the target the approach pose in a "found" stops. The
   # robot's reach plus its radius: driving to the target's own coordinates means
   # driving into it.
-  approach_standoff_m: 0.8
+  # Matches seek_approach_stop on the robot: far enough that the object is
+  # still in the camera's view, close enough that what remains is one short
+  # move into the grabbers.
+  approach_standoff_m: 0.55
 
   # --- when is T1 finished? ---
-  # Evaluated on every uploaded grid and reported in the map reply as
-  # data.t1_exit. The server never changes phase on its own: the transition is a
-  # decision about the mission, and leaving it with whoever runs the mission is
-  # also what lets you end T1 early for a demo.
+  # ADVISORY. Evaluated on every uploaded grid and reported in the map reply as
+  # data.t1_exit, and that is all it does: the server never changes phase on its
+  # own, because the transition is a decision about the mission.
+  #
+  # THE ROBOT DECIDES. mecanumbot_custom_nav2's exit_criteria.py holds the rule
+  # that actually ends T1, and it owns the latch that starts T2. The split is
+  # deliberate: the robot owns the frontier list (only it knows which frontiers
+  # it has already tried) and the battery, while this server owns the one thing
+  # the robot cannot know -- whether the cloud is placed and covering. So
+  # `placed` below is the test that matters here and it is mirrored on the robot
+  # as `min_agreement`; `explored`, `no_open_exits` and `not_growing` duplicate
+  # tests the robot makes with better information, and are kept as reported
+  # diagnostics rather than as decisions. See docs/INTEGRATION.md.
+  #
+  # `no_open_exits` additionally needs the robot to upload `exits`, which
+  # mecanumbot_deep3r does not send. It will read as trivially met; do not
+  # mistake that for the robot having run out of places to go.
   #
   # Four tests, and no one of them is enough alone:
   #   explored       necessary, and never sufficient -- the grid is a rectangle
@@ -291,7 +307,7 @@ mission:
   t1_max_open_exits: 0
   t1_stall_cells_per_s: 15.0
   t1_min_stall_window_s: 30.0
-  t1_min_agreement: 0.15
+  t1_min_agreement: 0.15    # mirrored on the robot as min_agreement
   t1_min_frames: 300
   t1_min_runtime_s: 60.0
 
@@ -346,9 +362,21 @@ seek:
   # an object higher than this cannot be picked up however close it drives.
   # Knowing that BEFORE driving is the whole value of having a reconstruction:
   # the LiDAR sees one horizontal plane and cannot tell the floor from the table.
-  grasp_z_max: 0.12
-  grasp_z_min: -0.05        # below the floor plane is a reconstruction error
-  reach_radius_m: 0.45      # how far from the base centre the gripper closes
+  #
+  # grasp_z_min/_max are SHARED WITH THE ROBOT: they must match
+  # seek_grasp_height_min / seek_grasp_height_max in mecanumbot_seek's
+  # seek_setting_constants.yaml. Both come from the same tape-measure fact --
+  # the shafts sit at z ~ 0.034 with a 0.116 m clear gap and there is no lift
+  # DOF. They disagreed until 2026-09-08 (0.12 here, 0.15 there), which gave the
+  # two ends opposite answers about the same object across a 3 cm band.
+  grasp_z_max: 0.15
+  grasp_z_min: 0.03         # under the shafts: in a recess, reported too_low
+  floor_tolerance_m: -0.05  # under the FLOOR: a reconstruction error, not an
+                            # object. Not the same test as grasp_z_min, and not
+                            # the same answer -- one is a bug, the other is
+                            # something to tell a person about.
+  reach_radius_m: 0.30      # how far from the base centre the gripper closes;
+                            # matches the robot's seek_grasp_distance
   robot_radius_m: 0.22      # footprint, for deciding if a standing cell is clear
 
   # --- remembering T1 ---

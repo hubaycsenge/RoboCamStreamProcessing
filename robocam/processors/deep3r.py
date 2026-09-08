@@ -39,6 +39,13 @@ The recurrent state is the map.  Three consequences the config has to face:
   that — it accepts unordered collections — but a *large* jump means the next
   frame overlaps nothing in the state, so ``reset_on_gap`` starts a new map
   instead of fusing two unrelated scenes.
+* **The phase change is deliberately not a reset.**  T2 folds its frames into
+  the same recurrent state T1 built, which is what "the second scan updates the
+  first" means in practice: one ``map_id``, one world frame, one cloud that
+  gets better.  Nothing here resets on ``t1 -> t2``, and ``reset_every`` should
+  stay 0 for a real mission for the same reason -- a reset mid-mission does not
+  degrade the cloud, it replaces it with an unrelated one, and every coordinate
+  the robot was handed from the T1 cloud stops meaning anything.
 * **State drifts over a long run.**  ``reset_every`` bounds it.  The model has
   the mechanism built in: a view flagged ``reset`` restores the initial state,
   so a reset costs nothing beyond the map it discards.
@@ -89,6 +96,7 @@ import cv2
 import numpy as np
 
 from .. import detect as detect_mod
+from .. import regions as regions_mod
 from .. import seek as seek_mod
 from .. import wire
 from ..compare import CameraMount, compare
@@ -477,6 +485,23 @@ class Deep3RProcessor(Processor):
         elif self.reset_every and self._frames_in_state >= self.reset_every:
             reset, reason = True, f"reset_every {self.reset_every} reached"
         if reset:
+            # A reset during t2 breaks the one property the mission's shape
+            # depends on: that the second scan *updates* the first.  The
+            # recurrent state is what carries T1's reconstruction into T2, so
+            # restarting it there does not produce a worse cloud -- it produces
+            # a different, unrelated one, in a world frame T1's target
+            # coordinates do not name.  It is not suppressed, because
+            # continuing to fold frames into a state the model has lost
+            # confidence in is worse; but it is the loudest thing this
+            # processor says.
+            if frame.phase == wire.PHASE_SEEK and self._state is not None:
+                log.warning(
+                    "RECONSTRUCTION RESET DURING T2 (%s): the second scan no "
+                    "longer updates the first, and every coordinate the robot "
+                    "was given from the T1 cloud now names a place in a world "
+                    "frame that does not exist. map_id %d -> %d",
+                    reason, self._map_id, self._map_id + 1,
+                )
             self._reset_state()
 
         t0 = time.monotonic()
@@ -888,6 +913,44 @@ class Deep3RProcessor(Processor):
                 payload,
             )
             stats["announced_patch_bytes"] = len(payload)
+
+        # The verdict, always -- including when there was no patch to send.  A
+        # comparison that agreed with nothing produces no map_update, and that
+        # is exactly the verdict the robot most needs to hear: it is what stops
+        # T1 finishing over a cloud that was never placed.  See wire.agreement.
+        if cfg.send_agreement and result.cloud_occupied is not None:
+            heights = regions_mod.cell_heights(
+                result.points_map, frame.grid, z_min=cfg.z_min, z_max=cfg.z_max,
+            )
+            found_regions = regions_mod.extract_regions(
+                result.cloud_occupied, frame.grid, heights,
+                block_m=cfg.region_block_m,
+                min_cells_per_block=cfg.region_min_cells,
+                max_regions=cfg.max_regions,
+            )
+            cover = regions_mod.coverage(result.cloud_occupied, frame.grid)
+            agr = regions_mod.agreement_payload(
+                stats, found_regions, cover, cloud_points=int(points.shape[0]),
+            )
+            stats["grid_coverage"] = agr["grid_coverage"]
+            stats["cloud_coverage"] = agr["cloud_coverage"]
+            stats["regions"] = agr["regions"]
+            frame.announce(wire.agreement(
+                seq=0,
+                frame=frame.grid.frame,
+                map_id=frame.grid.map_id,
+                cloud_map_id=self._map_id,
+                grid_coverage=agr["grid_coverage"],
+                cloud_coverage=agr["cloud_coverage"],
+                agreement_value=float(stats.get("agreement") or 0.0),
+                compared_cells=agr["compared_cells"],
+                conflicting_cells=agr["conflicting_cells"],
+                cloud_points=agr["cloud_points"],
+                regions=agr,
+                from_frame_seq=frame.seq,
+                data={"z_slice": [cfg.z_min, cfg.z_max],
+                      "free_cells": cover.get("free_cells", 0)},
+            ))
 
         shift = stats.get("shift")
         if shift:

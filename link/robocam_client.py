@@ -99,6 +99,7 @@ MSG_EXITS_RESULT = "exits_result"
 MSG_MAP_UPDATE = "map_update"
 MSG_POSE_HINT = "pose_hint"
 MSG_FOUND = "found"
+MSG_AGREEMENT = "agreement"
 MSG_PHASE = "phase"
 MSG_PING = "ping"
 MSG_PONG = "pong"
@@ -2528,6 +2529,7 @@ class RoboCamClient:
         on_map_update: Optional[Callable[[Dict[str, Any], np.ndarray], None]] = None,
         on_pose_hint: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_found: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_agreement: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_exits_result: Optional[Callable[[Dict[str, Any]], None]] = None,
         phase: str = PHASE_EXPLORE,
         mission: Optional[Dict[str, Any]] = None,
@@ -2565,6 +2567,7 @@ class RoboCamClient:
         self.on_map_update = on_map_update
         self.on_pose_hint = on_pose_hint
         self.on_found = on_found
+        self.on_agreement = on_agreement
         self.on_exits_result = on_exits_result
         self.phase = phase
         self.mission = dict(mission or {})
@@ -2634,6 +2637,7 @@ class RoboCamClient:
         self.map_updates_received = 0
         self.pose_hints_received = 0
         self.founds_received = 0
+        self.agreements_received = 0
         self._rtt_sum = 0.0
         self._rtt_n = 0
         self._last_scan_summary: Dict[str, Any] = {}
@@ -3408,6 +3412,27 @@ class RoboCamClient:
             elif self.founds_received == 1:
                 log.warning("no on_found callback: the server has located the target "
                             "and nothing on this robot is driving to it")
+            return
+
+        if mtype == MSG_AGREEMENT:
+            self.agreements_received += 1
+            n = len(header.get("uncertain_kinds", []) or [])
+            log.info("agreement %.2f | grid coverage %.2f, cloud coverage %.2f | "
+                     "%d cells compared, %d conflicting | %d region%s",
+                     header.get("agreement", 0.0), header.get("grid_coverage", 0.0),
+                     header.get("cloud_coverage", 0.0), header.get("compared_cells", 0),
+                     header.get("conflicting_cells", 0), n, "" if n == 1 else "s")
+            if self.on_agreement is not None:
+                try:
+                    self.on_agreement(header)
+                except Exception:
+                    log.exception("on_agreement callback raised")
+            elif self.agreements_received == 1:
+                # Worth saying once: without a consumer the robot's T1 CLOUD
+                # exit criterion can never be satisfied, and the run will look
+                # like an explorer that simply refuses to finish.
+                log.warning("no on_agreement callback: the server is reporting how the "
+                            "cloud and the map agree and nothing here is listening")
             return
 
         if mtype == MSG_EXITS_RESULT:

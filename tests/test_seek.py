@@ -250,6 +250,52 @@ def test_a_point_under_the_floor_is_a_reconstruction_error_not_an_object():
     assert reach.verdict == "below_floor"
 
 
+def test_an_object_in_a_recess_is_too_low_not_a_reconstruction_error():
+    """The band that used to be missing entirely.
+
+    Above the floor and under the shafts is a real object the robot cannot get
+    under -- something to drive a person to and point at.  Reporting it as
+    ``below_floor`` would file it as a bug in the reconstruction, and the robot
+    would say nothing to anybody about a mug it can see under a cupboard.
+    """
+    reach = judge_reach(a_sighting(z=0.01), ReachEnvelope(), an_open_grid(), (0.5, 0.0))
+    assert reach.reachable is False
+    assert reach.verdict == "too_low"
+    # And it still gets an approach, like every other located-but-unreachable
+    # object: knowing where it is has value even when it cannot be picked up.
+    assert reach.approach is not None
+
+
+def test_the_three_height_bands_are_contiguous_and_ordered():
+    """Below floor, too low, reachable, too high -- with no gap between them.
+
+    A gap would be an object that gets no verdict at all; an overlap would be
+    one that gets two.  The boundaries come from the same tape-measure facts the
+    robot's ``mecanumbot_seek.reachability`` uses, and the whole point of this
+    test is that a change to one end is visible here.
+    """
+    envelope = ReachEnvelope()
+    grid, here = an_open_grid(), (0.5, 0.0)
+    verdicts = [judge_reach(a_sighting(z=z), envelope, grid, here).verdict
+                for z in (-0.10, -0.01, 0.08, 0.30)]
+    assert verdicts == ["below_floor", "too_low", "reachable", "too_high"]
+
+
+def test_the_grasp_band_matches_the_robot_s_constants():
+    """The 3 cm disagreement that gave the two ends opposite answers.
+
+    ``mecanumbot_seek/config/seek_setting_constants.yaml`` carries
+    ``seek_grasp_height_min: 0.03`` and ``seek_grasp_height_max: 0.15``, derived
+    from the shafts at z ~ 0.034 with a 0.116 m clear gap.  This server used to
+    say 0.12 and -0.05.  Changing either end is a decision about the robot's
+    hardware and has to be made in both places at once.
+    """
+    envelope = ReachEnvelope()
+    assert (envelope.grasp_z_min, envelope.grasp_z_max) == (0.03, 0.15)
+    assert envelope.reach_radius_m == 0.30      # robot: seek_grasp_distance
+    assert envelope.standoff_m == 0.55          # robot: seek_approach_stop
+
+
 def test_an_unmeasurable_height_is_unknown_rather_than_a_guess():
     """The third value, and why it is not folded into False.
 

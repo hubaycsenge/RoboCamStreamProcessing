@@ -115,6 +115,14 @@ class CompareResult:
     stats: Dict[str, Any] = field(default_factory=dict)
     #: The full updated grid, for a caller that wants to keep a merged copy.
     updated: Optional[np.ndarray] = None
+    #: The boolean "the cloud says occupied" grid this comparison was made from,
+    #: and the cloud in map-frame metres.  Kept so that :mod:`robocam.regions`
+    #: can cluster the disagreement without redoing the transform and the
+    #: binning -- both of which cost more than the clustering does, and neither
+    #: of which would be guaranteed to reproduce the same cells if a parameter
+    #: drifted between the two calls.  ``None`` when the comparison refused.
+    cloud_occupied: Optional[np.ndarray] = None
+    points_map: Optional[np.ndarray] = None
 
     @property
     def ok(self) -> bool:
@@ -387,6 +395,8 @@ def compare(
     cloud_occupied, bin_stats = occupancy_from_cloud(
         points_map, grid, z_min=z_min, z_max=z_max, min_points=min_points,
     )
+    result.cloud_occupied = cloud_occupied
+    result.points_map = points_map
 
     occupied_map, free_map, unknown_map = grid.classify()
     agree = cloud_occupied & occupied_map

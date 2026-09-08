@@ -527,9 +527,12 @@ def test_the_comparison_announces_a_patch_for_a_table_the_scanner_missed():
 
     assert stats["ran"] is True
     assert stats["new_cells"] > 20
-    assert len(f.announcements) == 1
-    header, payload = f.announcements[0]
-    assert header["type"] == "map_update"
+    # Two announcements now: the patch, and the verdict that always accompanies
+    # a comparison whether or not it produced one.  Select by type rather than
+    # by position -- the order is the processor's business, not the contract's.
+    by_type = {h["type"]: (h, p) for h, p in f.announcements}
+    assert set(by_type) == {"map_update", "agreement"}
+    header, payload = by_type["map_update"]
     assert header["map_id"] == "m1"
     assert header["merge"] == "max"
     assert header["cells_changed"] == stats["new_cells"]
@@ -537,6 +540,89 @@ def test_the_comparison_announces_a_patch_for_a_table_the_scanner_missed():
     # a worker thread has no business allocating them.
     assert header["seq"] == 0
     assert len(payload) > 0
+
+
+def test_the_verdict_is_announced_even_when_there_is_no_patch():
+    """The reason `agreement` is its own message and not a field on `map_update`.
+
+    A cloud that agrees with nothing produces no patch -- `compare` suppresses
+    the update below `min_new_cells` -- and that is exactly the verdict the
+    robot most needs, because it is what stops T1 finishing over a
+    reconstruction that was never placed.  A robot listening only for
+    `map_update` would hear the same silence here as in a fully merged room.
+    """
+    proc = a_configured_proc(compare={"min_points": 1, "camera_z": 0.5,
+                                      "camera_x": 0.0})
+    f = a_frame_with_a_map()
+    # Three points is under the patch threshold, so nothing is merged.
+    points = a_table_in_optical_coordinates(f, proc)[:3]
+
+    stats = proc._compare_with_map(f, points, np.eye(4))
+
+    types = {h["type"] for h, _ in f.announcements}
+    assert "map_update" not in types
+    assert "agreement" in types
+    assert stats["ran"] is True
+
+
+def test_the_verdict_carries_both_map_identities_separately():
+    """The robot's map and CUT3R's are different things that invalidate differently."""
+    proc = a_configured_proc(compare={"min_points": 1, "camera_z": 0.5,
+                                      "camera_x": 0.0})
+    f = a_frame_with_a_map()
+    proc._compare_with_map(f, a_table_in_optical_coordinates(f, proc), np.eye(4))
+
+    header = next(h for h, _ in f.announcements if h["type"] == "agreement")
+    assert header["map_id"] == "m1"          # the robot's SLAM map, a string
+    assert isinstance(header["cloud_map_id"], int)   # CUT3R's session, an int
+
+
+def test_the_verdict_region_arrays_stay_parallel():
+    """The robot indexes all six with one subscript."""
+    proc = a_configured_proc(compare={"min_points": 1, "camera_z": 0.5,
+                                      "camera_x": 0.0})
+    f = a_frame_with_a_map()
+    proc._compare_with_map(f, a_table_in_optical_coordinates(f, proc), np.eye(4))
+
+    header = next(h for h, _ in f.announcements if h["type"] == "agreement")
+    lengths = {len(header[k]) for k in (
+        "uncertain_x", "uncertain_y", "uncertain_scores",
+        "uncertain_kinds", "uncertain_heights", "uncertain_radii")}
+    assert len(lengths) == 1
+
+
+def test_no_verdict_when_send_agreement_is_off():
+    proc = a_configured_proc(compare={"min_points": 1, "camera_z": 0.5,
+                                      "camera_x": 0.0, "send_agreement": False})
+    f = a_frame_with_a_map()
+    proc._compare_with_map(f, a_table_in_optical_coordinates(f, proc), np.eye(4))
+    assert "agreement" not in {h["type"] for h, _ in f.announcements}
+
+
+def test_the_phase_change_does_not_restart_the_reconstruction():
+    """The property "the second scan updates the first" rests on exactly this.
+
+    T2 folds its frames into the same recurrent state T1 built: one map_id, one
+    world frame, one cloud that gets better. If a phase change reset the state,
+    T2 would build an unrelated reconstruction and every coordinate the robot
+    was handed from the T1 cloud would name a place in a world frame that no
+    longer exists -- while looking like a perfectly good goal.
+    """
+    proc = a_configured_proc()
+    stub_model(proc)
+    first = a_frame_with_a_map()
+    first.phase = "t1"
+    proc.process(first)
+    map_id_after_t1 = proc._map_id
+    frames_after_t1 = proc._frames_in_state
+
+    second = a_frame_with_a_map()
+    second.seq = first.seq + 1
+    second.phase = "t2"
+    proc.process(second)
+
+    assert proc._map_id == map_id_after_t1, "the phase change restarted the map"
+    assert proc._frames_in_state == frames_after_t1 + 1
 
 
 def test_nothing_is_announced_when_the_frames_do_not_match():

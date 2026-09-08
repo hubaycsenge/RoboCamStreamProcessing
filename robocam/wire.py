@@ -101,12 +101,13 @@ MSG_MAP_RESULT = "map_result"    # server -> client, one result per grid
 MSG_EXITS = "exits"      # client -> server, the robot's exit/frontier candidates
 MSG_EXITS_RESULT = "exits_result"  # server -> client, the same candidates ranked
 
-# The three server products.  Unlike everything above these are announcements,
+# The four server products.  Unlike everything above these are announcements,
 # not replies: they are emitted when Compare or the decision stage finishes, and
 # the robot never asks for one.
 MSG_MAP_UPDATE = "map_update"    # server -> client, cells Compare wants merged
 MSG_POSE_HINT = "pose_hint"      # server -> client, a correction *offered* to SLAM
 MSG_FOUND = "found"              # server -> client, T2: the target and where it is
+MSG_AGREEMENT = "agreement"      # server -> client, the comparison verdict + regions
 
 MSG_PHASE = "phase"      # either direction, move between t1 and t2
 MSG_PING = "ping"        # client -> server, liveness probe
@@ -979,6 +980,88 @@ def pose_hint(
         "data": data or {},
         "t_send_ns": monotonic_ns(),
     }
+    if from_frame_seq is not None:
+        header["from_frame_seq"] = int(from_frame_seq)
+    return header
+
+
+def agreement(
+    seq: int,
+    *,
+    frame: str = "map",
+    map_id: str = "",
+    cloud_map_id: int | None = None,
+    grid_coverage: float = 0.0,
+    cloud_coverage: float = 0.0,
+    agreement_value: float = 0.0,
+    compared_cells: int = 0,
+    conflicting_cells: int = 0,
+    cloud_points: int = 0,
+    regions=None,
+    from_frame_seq: int | None = None,
+    data: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Header for the comparison verdict: how the two sources agree, and where they do not.
+
+    This is the fourth announcement and the one the robot's exploration actually
+    runs on.  ``map_update`` says *merge these cells*; this says *here is what
+    the comparison found*, which is a different message with a different
+    lifetime — and, crucially, one that must arrive **even when there is nothing
+    to merge**.
+
+    That asymmetry is the whole reason this is not a field on ``map_update``.
+    The most important verdict this server can send is "the cloud agrees with
+    nothing", and that verdict produces no patch: ``compare`` suppresses the
+    update below ``min_new_cells``, and a robot waiting for ``map_update`` to
+    learn how the comparison is going would hear silence at exactly the moment
+    the news matters most.  Silence is also what a healthy, fully-merged room
+    sounds like, so the robot could not tell the two apart.
+
+    ``regions`` is the list from :func:`robocam.regions.extract_regions`, already
+    split into the parallel arrays ``mecanumbot_msgs/MapCloudAgreement`` uses.
+    They are parallel and must stay so: the robot indexes all six with one
+    subscript, and a bridge that rebuilt them from a list of dicts would be a
+    second place for the ordering to break.
+
+    ``map_id`` is **the robot's**, echoed back, and ``cloud_map_id`` is CUT3R's.
+    Both travel because they invalidate different things: a robot ``map_id``
+    change means these coordinates name a place in a map that no longer exists,
+    while a ``cloud_map_id`` change means the reconstruction they were derived
+    from has restarted.  A consumer that keys on the wrong one drops state on
+    the wrong event and keeps it across the event that actually matters.
+
+    A height of ``null`` means the region has structure the server could not
+    measure, and it is not the same as zero.  The robot is required to treat an
+    unmeasurable height as blocking: assuming an overhang is the one reading
+    that drives it into something.
+    """
+    regions = regions or {}
+    header = {
+        "type": MSG_AGREEMENT,
+        "seq": seq,
+        "frame": frame,
+        "map_id": map_id,
+        "grid_coverage": round(float(grid_coverage), 4),
+        "cloud_coverage": round(float(cloud_coverage), 4),
+        "agreement": round(float(agreement_value), 4),
+        "compared_cells": int(compared_cells),
+        "conflicting_cells": int(conflicting_cells),
+        "cloud_points": int(cloud_points),
+        "uncertain_x": [round(float(v), 3) for v in regions.get("uncertain_x", [])],
+        "uncertain_y": [round(float(v), 3) for v in regions.get("uncertain_y", [])],
+        "uncertain_scores": [round(float(v), 4) for v in regions.get("uncertain_scores", [])],
+        "uncertain_kinds": [str(v) for v in regions.get("uncertain_kinds", [])],
+        # None survives JSON as null and is what an unmeasurable height must be.
+        "uncertain_heights": [
+            None if v is None else round(float(v), 3)
+            for v in regions.get("uncertain_heights", [])
+        ],
+        "uncertain_radii": [round(float(v), 3) for v in regions.get("uncertain_radii", [])],
+        "data": data or {},
+        "t_send_ns": monotonic_ns(),
+    }
+    if cloud_map_id is not None:
+        header["cloud_map_id"] = int(cloud_map_id)
     if from_frame_seq is not None:
         header["from_frame_seq"] = int(from_frame_seq)
     return header

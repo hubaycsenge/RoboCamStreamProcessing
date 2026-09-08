@@ -71,6 +71,11 @@ BASIS_MEMORY = "memory"
 REACH_OK = "reachable"
 REACH_TOO_HIGH = "too_high"
 REACH_BELOW_FLOOR = "below_floor"
+#: Above the floor but under the grabber shafts -- in a recess, under
+#: something.  Distinct from ``below_floor``, which is a reconstruction error
+#: rather than an object, and matching ``too_low`` in the robot's
+#: ``mecanumbot_seek.reachability``.
+REACH_TOO_LOW = "too_low"
 REACH_NO_STANDING_ROOM = "no_standing_room"
 REACH_UNKNOWN = "unknown"
 
@@ -378,17 +383,35 @@ class ReachEnvelope:
     reconstruction rather than a scanner.
     """
 
-    #: Below this the point is under the floor, which is a reconstruction error
-    #: rather than an object.  Slightly negative because the map's floor plane is
-    #: a plane and a real floor is not.
-    grasp_z_min: float = -0.05
+    #: Bottom of the gripper's vertical envelope, above the floor.  The shafts
+    #: sit at z ~ 0.034 with a 0.116 m clear gap and there is no lift DOF, so
+    #: this and ``grasp_z_max`` are the two ends of that gap.  Below it the
+    #: object is in a recess or under something: real, and not gettable.
+    #:
+    #: **These two numbers are shared with the robot** and must match
+    #: ``seek_grasp_height_min`` / ``_max`` in ``mecanumbot_seek``'s constants.
+    #: They disagreed until 2026-09-08 (0.12 here against 0.15 there), which
+    #: gave the two ends opposite answers about the same object over a 3 cm
+    #: band -- the server promising a grasp the tree then refused, and the
+    #: server refusing one the grabbers would have closed on.
+    grasp_z_min: float = 0.03
     #: Top of the gripper's vertical envelope, above the floor.
-    grasp_z_max: float = 0.12
+    grasp_z_max: float = 0.15
+    #: Below this the point is under the floor, which is a reconstruction error
+    #: rather than an object.  Slightly negative because the map's floor plane
+    #: is a plane and a real floor is not.  This is **not** the bottom of the
+    #: grasp band: the two were one field, and conflating "the model produced a
+    #: point in the basement" with "the mug is in a recess" loses the
+    #: distinction between a bug and a thing to tell somebody about.
+    floor_tolerance_m: float = -0.05
     #: How far from the base centre the gripper closes.  Used to ask whether any
-    #: standing position exists from which the object is in range.
-    reach_radius_m: float = 0.45
+    #: standing position exists from which the object is in range.  Matches
+    #: ``seek_grasp_distance`` on the robot, which is the distance at which the
+    #: tree will actually attempt a grasp.
+    reach_radius_m: float = 0.30
     #: How far short of the object the robot should stop, for the nav goal.
-    standoff_m: float = 0.8
+    #: Matches ``seek_approach_stop`` on the robot.
+    standoff_m: float = 0.55
     #: Footprint radius, for deciding whether a candidate standing cell is clear.
     robot_radius_m: float = 0.22
 
@@ -522,6 +545,7 @@ def judge_reach(
     """
     detail: Dict[str, Any] = {
         "grasp_z": [envelope.grasp_z_min, envelope.grasp_z_max],
+        "floor_tolerance_m": envelope.floor_tolerance_m,
         "reach_radius_m": envelope.reach_radius_m,
         "standoff_m": envelope.standoff_m,
     }
@@ -542,12 +566,23 @@ def judge_reach(
                      z_above_floor=sighting.z, approach=None,
                      reason=note or "nowhere to stand", detail=detail)
 
-    if sighting.z < envelope.grasp_z_min:
+    if sighting.z < envelope.floor_tolerance_m:
         return Reach(
             reachable=False, verdict=REACH_BELOW_FLOOR, z_above_floor=sighting.z,
             approach=approach,
             reason=(f"{sighting.z:.2f} m is below the map's floor plane, which is a "
                     "reconstruction error rather than an object"),
+            detail=detail)
+
+    if sighting.z < envelope.grasp_z_min:
+        # Above the floor and below the shafts: in a recess, under a cupboard,
+        # behind a kick board.  A real object the robot cannot get under, which
+        # is a thing to tell a person about rather than a reconstruction fault.
+        return Reach(
+            reachable=False, verdict=REACH_TOO_LOW, z_above_floor=sighting.z,
+            approach=approach,
+            reason=(f"{sighting.z:.2f} m above the floor, under the gripper's "
+                    f"{envelope.grasp_z_min:.2f} m shafts"),
             detail=detail)
 
     if sighting.z > envelope.grasp_z_max:

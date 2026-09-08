@@ -17,6 +17,13 @@ over the stream and returns a metric point cloud per frame — see
 in the same way, without the wire protocol changing. See
 [Adding a model](#adding-a-model).
 
+**The robot's ROS 2 workspace does not yet speak protocol 2.** Everything below
+about the map loop and the decision stage is implemented and tested here, and
+has no consumer on the robot: `mecanumbot_deep3r` still streams frames and
+republishes clouds, nothing more. What is missing on each side, and the order it
+is being closed in, is [`docs/INTEGRATION.md`](docs/INTEGRATION.md) — read it
+before wiring anything to this server.
+
 Protocol 2 added the second half of the system diagram: the robot's **pose** and
 its **2D occupancy grid** go up, the server's `compare` stage diffs the
 reconstruction against that grid, and what it finds comes back as **map
@@ -1029,6 +1036,12 @@ a valid goal.
 
 ### Serving it
 
+This is the **cluster half of starting T1**, and it goes first: the robot dials
+a tunnel that must already have a live server behind it. The robot half, and
+what to watch once both are up, is `mecanumbot_custom_nav2/README.md` under
+"Starting T1" — that package owns the phase, so the sequence lives there rather
+than in two places that can drift.
+
 The job that serves the robot can run on **any** node with a free GPU:
 
 ```bash
@@ -1036,11 +1049,27 @@ salloc --no-shell --gres=gpu:1 -c 8 --mem=24G -t 08:00:00
 srun --jobid=<id> --overlap ./scripts/run_deep3r_bridged.sh
 ```
 
+Allocate **from nipg1** (see the two constraints below). No `--phase` argument
+for T1: `config/server.yaml` starts in `t1` already, and the server never
+changes phase on its own — the robot tells it, when the explorer latches
+`exploration/finished`. Model load plus warm-up is about 25 s; wait for the bind
+line before starting anything on the robot.
+
 `run_deep3r_bridged.sh` starts the server, waits for it to bind, and only then
 opens a reverse tunnel to nipg1:5555 — the port the robot's own forward tunnel
 is already waiting on. Ordering it that way means a live tunnel implies a live
 server, never a socket in front of nothing. Use plain `run_deep3r.sh` for local
 benchmarking, where nothing has to cross the cluster boundary.
+
+For T2 the target can be named here instead of by the robot, which is useful
+when driving the mission from the cluster side:
+
+```bash
+srun --jobid=<id> --overlap ./scripts/run_deep3r_bridged.sh \
+     --phase t2 --detector owl --target 'the red mug on the desk'
+```
+
+A target the robot sends wins over this one.
 
 Prefer Ampere or newer. **nipg10's 3090s are sm_86 and much faster than nipg36's
 TITAN RTX** (sm_75, Turing, no bf16) — see
@@ -1124,6 +1153,10 @@ link/                    everything crossing the robot <-> cluster boundary
   netcheck.sh            can the robot reach the server?
   robot-addr.sh          which of the two lab subnets the robot is on today
 config/server.yaml
+docs/
+  INTEGRATION.md         the contract with the robot's ROS 2 workspace: what
+                         each end expects, where they disagree, and the plan
+  system_diagram_v2.drawio.png
 scripts/                 setup_server.sh, run_server.sh, run_deep3r.sh
   run_deep3r_bridged.sh  cluster-side half of the data path: server + the
                          reverse tunnel to the rendezvous on nipg1
