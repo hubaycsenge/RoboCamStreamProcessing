@@ -220,6 +220,12 @@ compare:
   #
   # On this robot the camera is on a neck motor, so camera_pitch is whatever the
   # neck is commanded to; these defaults describe it looking level.
+  #
+  # They are a FALLBACK. mecanumbot_deep3r attaches the camera's pose to every
+  # frame (from the neck's position; see its README), and a frame that carries
+  # one is placed with that instead -- the result's data.compare.camera_from
+  # says "robot". Once a session has sent one, a frame without it is not placed
+  # at all. These values only matter for a robot that does not send it.
   camera_x: 0.10
   camera_y: 0.0
   camera_z: 0.45
@@ -240,6 +246,28 @@ compare:
   search_cells: 4
   # A correction the robot has not had time to apply will only be measured again.
   min_hint_interval_ms: 2000.0
+
+  # --- the agreement verdict, and the robot's costmap ---
+  # These three are a rate-control group, and they were first set too fast.
+  # Every verdict makes the robot re-evaluate its keepouts and its revisit
+  # list; at 1 Hz with 32 regions that churned nav2's costmap and the
+  # explorer's goal, which on the robot looks like driving in short bursts
+  # with stops between them rather than like anything to do with the cloud.
+  #
+  # `mecanumbot_map_agreement` now also refuses to republish an unchanged mask
+  # or revisit list, so these are the second line of defence rather than the
+  # only one. Raise the interval further if the robot still hesitates; the
+  # exploration decides where to go at walking pace and does not need more.
+  send_agreement: true
+  min_agreement_interval_ms: 3000.0
+  # Regions per verdict. The robot services one revisit goal per
+  # `uncertain_every` frontier goals, so a list much longer than that is churn
+  # with no benefit, and its low-scoring tail is what changes between verdicts.
+  max_regions: 12
+  # Side of the square the disagreement is pooled into before clustering.
+  # Below about 0.3 m the list fills with reconstruction noise.
+  region_block_m: 0.5
+  region_min_cells: 3
 
 mission:
   # The two rows of the system diagram.

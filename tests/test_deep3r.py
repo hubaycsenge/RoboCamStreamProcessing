@@ -625,6 +625,102 @@ def test_the_phase_change_does_not_restart_the_reconstruction():
     assert proc._frames_in_state == frames_after_t1 + 1
 
 
+class TestWipingOnANewRun:
+    """
+    The server outlives the robot, so it has to be told when a run is over.
+
+    It is a Slurm job held for eight hours across many robot restarts. Without
+    this, a relaunched robot folds its first frames into the previous run's
+    recurrent state -- reconstructing a new pass into a world frame anchored on
+    a room it may have left -- and T2's retro-search can find the target in a
+    keyframe from the last run and hand back a coordinate in that run's map
+    frame. Both are wrong with full confidence, which is the worst way for this
+    system to fail.
+
+    The distinction is relaunch versus reconnect, and it is the whole design:
+    the run id is minted once per client *process*, so a dropped tunnel and the
+    reconnect after it carry the same id.
+    """
+
+    def a_frame(self, run_id, seq=0):
+        f = a_frame_with_a_map()
+        f.run_id = run_id
+        f.seq = seq
+        return f
+
+    def test_a_new_run_clears_the_reconstruction(self):
+        proc = a_configured_proc()
+        stub_model(proc)
+        proc.process(self.a_frame("run-a", 0))
+        proc.process(self.a_frame("run-a", 1))
+        assert proc._frames_in_state == 2
+        map_id_before = proc._map_id
+
+        proc.process(self.a_frame("run-b", 2))
+
+        assert proc._frames_in_state == 1, "the new run kept the old state"
+        assert proc._map_id != map_id_before, "map_id must change with the run"
+
+    def test_a_reconnect_does_not_clear_it(self):
+        """A WiFi blip must not cost a good scan."""
+        proc = a_configured_proc()
+        stub_model(proc)
+        proc.process(self.a_frame("run-a", 0))
+        proc.process(self.a_frame("run-a", 1))
+        map_id_before = proc._map_id
+
+        # Same run, and the sequence restarts because the session did.
+        proc.process(self.a_frame("run-a", 0))
+
+        assert proc._map_id == map_id_before
+        assert proc._frames_in_state == 3
+
+    def test_the_first_run_is_not_reported_as_a_reset(self):
+        """A fresh server has nothing to forget; it must not claim otherwise.
+
+        The first frame of any run does reset the model state -- that is the
+        "first frame" path and it is how CUT3R is started -- but `new_run` is
+        about discarding a *previous* run, and on a fresh server there is none.
+        Calling it anyway would put a wipe in the log for every start.
+        """
+        proc = a_configured_proc()
+        stub_model(proc)
+        wipes = []
+        proc.new_run = lambda run_id: wipes.append(run_id)
+
+        proc.process(self.a_frame("run-a", 0))
+        proc.process(self.a_frame("run-a", 1))
+        assert wipes == []
+
+        proc.process(self.a_frame("run-b", 2))
+        assert wipes == ["run-b"]
+
+    def test_a_client_that_cannot_say_is_never_wiped(self):
+        """An empty run id means 'cannot tell', not 'new run'."""
+        proc = a_configured_proc()
+        stub_model(proc)
+        proc.process(self.a_frame("", 0))
+        proc.process(self.a_frame("", 1))
+        map_id_before = proc._map_id
+        proc.process(self.a_frame("", 2))
+        assert proc._map_id == map_id_before
+        assert proc._frames_in_state == 3
+
+    def test_the_target_memory_does_not_survive_a_run(self):
+        """Otherwise T2 drives to where the object was in a different room."""
+        import robocam.seek as seek_mod
+        proc = a_configured_proc()
+        stub_model(proc)
+        proc.process(self.a_frame("run-a", 0))
+        proc._memory.remember(
+            seek_mod.Sighting(target="mug", x=1.0, y=2.0, z=0.1,
+                              confidence=0.9, map_id="m1"))
+        assert proc._memory.recall(target="mug", map_id="m1") is not None
+
+        proc.process(self.a_frame("run-b", 1))
+        assert proc._memory.recall(target="mug", map_id="m1") is None
+
+
 def test_nothing_is_announced_when_the_frames_do_not_match():
     """The refusal, from inside the processor rather than only in compare()."""
     from robocam.odometry import Odom

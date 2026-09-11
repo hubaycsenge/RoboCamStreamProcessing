@@ -135,3 +135,67 @@ def test_compose_applies_a_correction_in_the_map_frame():
 
 def _quat_from_yaw(yaw: float):
     return (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
+
+
+# -- the pose attached to a frame ---------------------------------------------
+
+def a_frame_pose(**camera_overrides):
+    camera = {"frame": "base_link", "x": 0.13, "y": 0.0, "z": 0.21,
+              "qw": 1.0, "qx": 0.0, "qy": 0.0, "qz": 0.0, "source": "neck_model"}
+    camera.update(camera_overrides)
+    return {"frame": "map", "child_frame": "base_link", "x": 1.0, "y": 2.0, "z": 0.0,
+            "qw": 1.0, "qx": 0.0, "qy": 0.0, "qz": 0.0, "age_ms": -12.5, "camera": camera}
+
+
+def test_a_frame_pose_decodes_with_its_camera_and_its_age():
+    pose, age_ms = odometry.decode_frame_pose(a_frame_pose(), seq=4)
+    assert (pose.x, pose.y, pose.seq) == (1.0, 2.0, 4)
+    # Either side of the image's stamp is equally far from it.
+    assert age_ms == pytest.approx(12.5)
+    assert pose.camera.shape == (4, 4)
+    assert pose.camera[:3, 3] == pytest.approx([0.13, 0.0, 0.21])
+    assert pose.camera_source == "neck_model"
+
+
+def test_a_frame_pose_without_a_camera_leaves_the_mount_to_the_config():
+    raw = a_frame_pose()
+    del raw["camera"]
+    pose, _ = odometry.decode_frame_pose(raw)
+    assert pose.camera is None
+
+
+def test_a_camera_relative_to_another_base_is_refused():
+    """base_footprint vs base_link is a centimetre here and invisible downstream."""
+    with pytest.raises(OdomError, match="cannot be composed"):
+        odometry.decode_frame_pose(a_frame_pose(frame="base_footprint"))
+
+
+def test_a_camera_metres_from_the_robot_is_refused():
+    """Millimetres sent as metres put a 0.21 m camera 210 m up."""
+    with pytest.raises(OdomError, match="beyond"):
+        odometry.decode_frame_pose(a_frame_pose(z=210.0))
+
+
+@pytest.mark.parametrize("field,value", [("qw", float("nan")), ("x", "high")])
+def test_a_camera_that_is_not_numbers_is_refused(field, value):
+    with pytest.raises(OdomError):
+        odometry.decode_frame_pose(a_frame_pose(**{field: value}))
+
+
+def test_a_zero_camera_quaternion_is_refused():
+    with pytest.raises(OdomError, match="not a rotation"):
+        odometry.decode_frame_pose(a_frame_pose(qw=0.0))
+
+
+def test_a_camera_quaternion_becomes_the_rotation_it_names():
+    half = math.radians(30.0) / 2
+    pose, _ = odometry.decode_frame_pose(
+        a_frame_pose(qw=math.cos(half), qy=math.sin(half)))
+    # 30 degrees about y takes x to (cos 30, 0, -sin 30).
+    assert pose.camera[:3, 0] == pytest.approx(
+        [math.cos(math.radians(30)), 0.0, -math.sin(math.radians(30))])
+
+
+def test_a_frame_pose_that_is_not_an_object_is_refused():
+    with pytest.raises(OdomError, match="expected an object"):
+        odometry.decode_frame_pose([1.0, 2.0])

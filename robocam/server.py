@@ -84,6 +84,11 @@ class Session:
     identity: bytes
     session_id: str
     client_id: str = ""
+    #: Which run this session belongs to, from the client's hello. Minted once
+    #: per client *process*, so a reconnect after a dropped tunnel carries the
+    #: same value and a relaunched robot carries a new one. Empty from a client
+    #: that predates the field.
+    run_id: str = ""
     codec: str = wire.CODEC_JPEG
     declared_width: int = 0
     declared_height: int = 0
@@ -135,6 +140,13 @@ class Session:
     # since the last pose" is the number that says whether a frame gave the
     # reconstruction any new parallax, and it cannot be recovered afterwards.
     prev_odom: Optional[odom_mod.Odom] = None
+    # Poses the robot attached to frames rather than streamed beside them.
+    frame_poses: int = 0
+    frame_poses_failed: int = 0
+    # Set by the first frame pose that carried a camera.  From then on a frame
+    # without one is not placed: the robot has shown its camera moves, so the
+    # configured mount no longer describes where it is.
+    camera_poses_seen: bool = False
 
     # -- occupancy grid ---------------------------------------------------
     map_info: Dict[str, Any] = field(default_factory=dict)
@@ -613,6 +625,10 @@ class StreamServer:
                         "enabled": self.cfg.odom.enabled,
                         "expect_frame": self.cfg.odom.expect_frame,
                         "stale_after_ms": self.cfg.odom.stale_after_ms,
+                        # A pose attached to a frame is honoured, camera and
+                        # all.  A server without this key ignores one silently,
+                        # which is why the client looks for it.
+                        "frame_pose": self.cfg.odom.enabled,
                     },
                     "map": {
                         "enabled": self.cfg.map.enabled,
@@ -672,6 +688,7 @@ class StreamServer:
             identity=identity,
             session_id=_identity_to_session_id(identity),
             client_id=str(header.get("client_id", "")),
+            run_id=str(header.get("run_id", "") or ""),
             codec=str(header.get("codec", wire.CODEC_JPEG)),
             declared_width=int(header.get("width", 0) or 0),
             declared_height=int(header.get("height", 0) or 0),
@@ -780,6 +797,8 @@ class StreamServer:
         # to be wrong: this is what decides *where* everything the model produces
         # from this frame ends up on the robot's map.
         pose, odom_age_ms = session.fresh_odom(self.cfg.odom.stale_after_ms)
+        pose, odom_age_ms, pose_source = self._pose_for_frame(
+            session, header, seq, recv_ts_ns, pose, odom_age_ms)
 
         self._frame_counter += 1
         self.snapshots.maybe_offer(session.session_id, seq, image, self._frame_counter,
@@ -788,6 +807,7 @@ class StreamServer:
         frame = Frame(
             seq=seq,
             session_id=session.session_id,
+            run_id=session.run_id,
             image=image,
             header=header,
             recv_ts_ns=recv_ts_ns,
@@ -799,6 +819,7 @@ class StreamServer:
             imu_age_ms=imu_age_ms if burst is not None else 0.0,
             odom=pose,
             odom_age_ms=odom_age_ms if pose is not None else 0.0,
+            pose_source=pose_source,
             # The grid is handed over by reference and shared by every frame in
             # flight; see Frame.grid for why nothing may write to it in place.
             # No staleness cutoff: a map that is ten seconds old still describes
@@ -967,6 +988,53 @@ class StreamServer:
         ))
 
     # -- odometry path ----------------------------------------------------
+
+    def _pose_for_frame(self, session: Session, header: Dict[str, Any], seq: int,
+                        recv_ts_ns: int, stream_pose: Optional[odom_mod.Odom],
+                        stream_age_ms: float) -> Tuple[Optional[odom_mod.Odom], float, str]:
+        """The pose to place one frame with, its age, and where it came from.
+
+        A pose attached to the frame wins over the stream's latest: it was taken
+        at the image's own timestamp, and it can say where the camera was, which
+        the stream cannot.  ``source`` is ``"frame"``, ``"stream"`` or ``""``
+        for no pose, and travels back in the result as ``pose_source``.
+
+        Two refusals, both in favour of placing nothing over placing wrongly:
+
+        * A frame pose that does not decode is **not** replaced by the stream's.
+          The robot said something about this frame and it was malformed;
+          guessing what it meant is how a cloud lands in the wrong place looking
+          right.
+        * Once the session has sent a camera pose, a frame without one is not
+          placed.  The robot has shown that its camera moves, so the configured
+          mount describes a head that may be somewhere else.
+        """
+        attached = header.get("pose")
+        if attached is None:
+            if session.camera_poses_seen:
+                return None, 0.0, ""
+            return stream_pose, stream_age_ms, ("stream" if stream_pose is not None else "")
+        if not self.cfg.odom.enabled:
+            return None, 0.0, ""
+
+        try:
+            pose, age_ms = odom_mod.decode_frame_pose(attached, seq=seq, recv_ts_ns=recv_ts_ns)
+        except odom_mod.OdomError as exc:
+            session.frame_poses_failed += 1
+            log.warning("session %s: pose on frame seq=%d rejected: %s",
+                        session.session_id, seq, exc)
+            return None, 0.0, ""
+
+        session.frame_poses += 1
+        if pose.camera is not None:
+            if not session.camera_poses_seen:
+                log.info("session %s: the robot sends its camera pose per frame (%s); "
+                         "the configured camera mount is no longer used for it",
+                         session.session_id, pose.camera_source)
+            session.camera_poses_seen = True
+        elif session.camera_poses_seen:
+            return None, 0.0, ""
+        return pose, age_ms, "frame"
 
     def _on_odom(self, session: Session, header: Dict[str, Any], recv_ts_ns: int) -> None:
         """Parse and answer one pose.  No payload; the header is the message.
@@ -1405,6 +1473,7 @@ class StreamServer:
             imu_age_ms=frame.imu_age_ms if frame.imu is not None else None,
             odom_seq=frame.odom.seq if frame.odom is not None else None,
             odom_age_ms=frame.odom_age_ms if frame.odom is not None else None,
+            pose_source=frame.pose_source if frame.odom is not None else None,
             map_seq=frame.grid.seq if frame.grid is not None else None,
             map_id=frame.grid.map_id if frame.grid is not None else None,
         )

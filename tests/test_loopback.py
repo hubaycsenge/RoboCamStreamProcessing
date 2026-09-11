@@ -1145,3 +1145,104 @@ def test_a_server_with_the_decision_stage_off_says_so():
         assert welcome["server"]["seek"]["enabled"] is False
         assert welcome["server"]["seek"]["detector"] == ""
         peer.close()
+
+
+# -- the pose attached to a frame ----------------------------------------------
+
+def a_frame_pose(x=2.0, camera=True):
+    pose = {"frame": "map", "child_frame": "base_link", "x": x, "y": 0.0, "z": 0.0,
+            "yaw": 0.0, "qw": 1.0, "qx": 0.0, "qy": 0.0, "qz": 0.0, "age_ms": 8.0}
+    if camera:
+        pose["camera"] = {"frame": "base_link", "x": 0.13, "y": 0.0, "z": 0.21,
+                          "qw": 1.0, "qx": 0.0, "qy": 0.0, "qz": 0.0, "source": "pytest"}
+    return pose
+
+
+def a_posed_frame(peer, seq, pose):
+    peer.send(wire.frame(seq=seq, codec=wire.CODEC_JPEG, width=64, height=48,
+                         t_capture_ns=seq, pose=pose), jpeg(64, 48))
+    return peer.recv_of_type(wire.MSG_RESULT)
+
+
+def test_the_welcome_says_a_frame_pose_is_read(server):
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"posecap-peer")
+    peer.send(wire.hello("pytest"))
+    assert peer.recv_of_type(wire.MSG_WELCOME)["server"]["odom"]["frame_pose"] is True
+    peer.close()
+
+
+def test_a_pose_on_the_frame_wins_over_the_stream(server):
+    """The stream's latest is whichever arrived last; the frame's is the frame's."""
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"framepose-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+    peer.send_odom(7, x=1.0)
+    peer.recv_of_type(wire.MSG_ODOM_RESULT)
+
+    streamed = a_posed_frame(peer, 0, None)
+    assert streamed["odom_seq"] == 7
+    assert streamed["pose_source"] == "stream"
+
+    attached = a_posed_frame(peer, 1, a_frame_pose())
+    assert attached["odom_seq"] == 1          # the frame's own, not the stream's 7
+    assert attached["pose_source"] == "frame"
+    assert attached["odom_age_ms"] == pytest.approx(8.0)
+    peer.close()
+
+
+def test_after_a_camera_pose_a_frame_without_one_is_not_placed(server):
+    """The robot has shown its camera moves; the fixed mount no longer applies."""
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"camseen-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+
+    assert a_posed_frame(peer, 0, a_frame_pose())["pose_source"] == "frame"
+
+    peer.send_odom(3, x=1.0)
+    peer.recv_of_type(wire.MSG_ODOM_RESULT)
+    bare = a_posed_frame(peer, 1, None)
+    assert "odom_seq" not in bare and "pose_source" not in bare
+    without_camera = a_posed_frame(peer, 2, a_frame_pose(camera=False))
+    assert "odom_seq" not in without_camera
+    peer.close()
+
+
+def test_a_malformed_frame_pose_is_not_replaced_by_the_stream(server):
+    _, endpoint = server
+    peer = RawPeer(endpoint, b"badpose-peer")
+    peer.send(wire.hello("pytest"))
+    peer.recv_of_type(wire.MSG_WELCOME)
+    peer.send_odom(5, x=1.0)
+    peer.recv_of_type(wire.MSG_ODOM_RESULT)
+
+    broken = a_frame_pose()
+    broken["camera"]["frame"] = "base_footprint"
+    result = a_posed_frame(peer, 0, broken)
+    assert result["ok"] is True               # the frame itself is still processed
+    assert "odom_seq" not in result
+    peer.close()
+
+
+def test_the_real_client_carries_a_pose_on_each_frame(server):
+    """A source yielding a third element; the deployed client sends it."""
+    _, endpoint = server
+    results = []
+
+    class PosedSource(robocam_client.SyntheticSource):
+        def frames(self):
+            for img, pre_encoded in super().frames():
+                yield img, pre_encoded, a_frame_pose()
+
+    client = robocam_client.RoboCamClient(
+        server=endpoint, client_id="pytest-posed", max_inflight=2,
+        on_result=results.append,
+    )
+    client.run(PosedSource(160, 120, fps=20), duration=1.5, status_every=0)
+
+    assert client.frame_poses_sent > 0
+    assert client._server_takes_frame_pose is True
+    placed = [r for r in results if r.get("ok") and r.get("pose_source") == "frame"]
+    assert placed, f"no result placed with the frame's pose ({len(results)} results)"

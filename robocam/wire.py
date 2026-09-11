@@ -301,6 +301,7 @@ def decode(frames) -> Tuple[Dict[str, Any], bytes]:
 
 def hello(
     client_id: str,
+    run_id: str = "",
     codec: str = CODEC_JPEG,
     width: int = 0,
     height: int = 0,
@@ -318,6 +319,13 @@ def hello(
         "type": MSG_HELLO,
         "protocol": PROTOCOL_VERSION,
         "client_id": client_id,
+        # Which *run* this is, as distinct from which client.  Minted once per
+        # client process, so a reconnect after a dropped tunnel carries the same
+        # value and a relaunched robot carries a new one.  The server wipes its
+        # accumulated state when this changes and only then -- see
+        # Processor.new_run.  Empty from a client that predates the field, which
+        # the server treats as "cannot tell", i.e. does not wipe.
+        "run_id": run_id,
         "codec": codec,
         "width": width,
         "height": height,
@@ -376,12 +384,22 @@ def frame(
     t_capture_ns: int,
     channels: int = 3,
     extra: Dict[str, Any] | None = None,
+    pose: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Header for one image.
 
     ``width``/``height`` are what the client believes it sent.  The server
     reports the dimensions it actually decoded, which is how you catch a camera
     that silently renegotiated its format.
+
+    ``pose`` is optional and additive: an ``odom`` header's fields (``frame``,
+    ``child_frame``, ``x``/``y``/``z``, ``yaw``, ``qw``..``qz``) for where the
+    robot was *when this image was taken*, plus ``age_ms`` and, when the robot
+    knows it, a ``camera`` block -- ``frame`` (= the pose's ``child_frame``),
+    ``x``/``y``/``z``, ``qw``..``qz``, ``source`` -- giving the camera's
+    **optical** frame relative to the base.  The server places the frame with it
+    instead of the odom stream's latest and the configured camera mount; see
+    :func:`robocam.odometry.decode_frame_pose`.
     """
     header = {
         "type": MSG_FRAME,
@@ -395,6 +413,8 @@ def frame(
     }
     if extra:
         header["extra"] = extra
+    if pose is not None:
+        header["pose"] = pose
     return header
 
 
@@ -426,6 +446,7 @@ def result(
     odom_age_ms: float | None = None,
     map_seq: int | None = None,
     map_id: str | None = None,
+    pose_source: str | None = None,
 ) -> Dict[str, Any]:
     """Header for one result.
 
@@ -482,6 +503,10 @@ def result(
         header["odom_seq"] = odom_seq
     if odom_age_ms is not None:
         header["odom_age_ms"] = round(odom_age_ms, 2)
+    # "frame" or "stream": whether that pose was attached to this frame or was
+    # the odom stream's latest.  See ``frame(pose=...)``.
+    if pose_source:
+        header["pose_source"] = pose_source
     # Which of the robot's uploaded grids this result was computed against.
     if map_seq is not None:
         header["map_seq"] = map_seq

@@ -60,6 +60,14 @@ class Frame:
     seq: int
     session_id: str
     image: np.ndarray
+    # Which *run* this frame belongs to, from the client's hello.  Distinct
+    # from session_id, which changes on every reconnect: this changes only when
+    # the robot is relaunched.  A processor that accumulates anything compares
+    # it against the last one it saw and calls its own ``new_run`` when it
+    # differs -- on the worker thread, between frames, rather than from the IO
+    # thread mid-inference.  Empty from a client that predates the field, which
+    # means "cannot tell" and must not trigger a wipe.
+    run_id: str = ""
     # The header exactly as the client sent it.
     header: Dict[str, Any] = field(default_factory=dict)
     # Server monotonic clock, ns, when the payload came off the socket.
@@ -93,6 +101,10 @@ class Frame:
     odom: Optional[Odom] = None
     # Age of that pose in milliseconds when it was attached.
     odom_age_ms: float = 0.0
+    # "frame" when the robot attached the pose to this frame (taken at the
+    # image's timestamp, possibly with the camera's own pose in ``odom.camera``),
+    # "stream" when it is the odom stream's latest, "" when there is none.
+    pose_source: str = ""
     # The robot's latest occupancy grid, or None if it has not sent one.  Not
     # copied per frame: this is the session's grid and every frame in flight
     # shares it, so a processor must not write to ``grid.cells`` in place.
@@ -172,6 +184,25 @@ class Processor(abc.ABC):
     @abc.abstractmethod
     def process(self, frame: Frame) -> Optional[Dict[str, Any]]:
         """Handle one frame and return JSON-serialisable data for the robot."""
+
+    def new_run(self, run_id: str) -> None:
+        """Called when a robot announces a run this server has not seen.
+
+        The server is a Slurm job that outlives many robot restarts, so
+        everything a processor accumulates -- a recurrent state, a keyframe
+        store, a remembered target -- would otherwise leak from one run into
+        the next and be reported with full confidence about a room the robot
+        has left.
+
+        The distinction this hook rests on is **relaunch versus reconnect**.
+        The run id is minted once per client *process*, so a tunnel blip and
+        the reconnect that follows it carry the same id and must not wipe
+        anything: throwing away a good reconstruction because the WiFi hiccuped
+        is a worse failure than keeping a stale one. A new robot process means
+        a new run and a clean slate.
+
+        Default is a no-op: a stateless processor has nothing to forget.
+        """
 
     def close(self) -> None:
         """Called once at shutdown."""

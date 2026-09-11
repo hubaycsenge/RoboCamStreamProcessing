@@ -67,6 +67,7 @@ import struct
 import sys
 import threading
 import time
+import uuid
 import zlib
 from collections import deque
 from typing import Any, Callable, Deque, Dict, Iterator, List, Optional, Tuple
@@ -149,6 +150,11 @@ class FrameSource:
 
     A source may return pre-encoded JPEG bytes — the hardware encoder path does
     — in which case the client skips software encoding entirely.
+
+    A source may also yield a third element: a dict, or None, with the pose the
+    robot was at when that image was taken (see ``robocam.wire.frame``).  It is
+    sent on the frame itself rather than on the odom stream, because only the
+    frame knows which instant it belongs to.
     """
 
     width = 0
@@ -2513,6 +2519,7 @@ class RoboCamClient:
         self,
         server: str,
         client_id: str = "orin",
+        run_id: Optional[str] = None,
         codec: str = CODEC_JPEG,
         jpeg_quality: int = 85,
         max_inflight: int = 3,
@@ -2536,6 +2543,14 @@ class RoboCamClient:
     ) -> None:
         self.server = server
         self.client_id = client_id
+        # Minted once, here, and reused for the life of this object -- which is
+        # the whole point.  The server wipes its reconstruction, its keyframes
+        # and its remembered target when this changes, so it must change when
+        # the robot is *relaunched* and must NOT change when a dropped tunnel
+        # forces a reconnect.  Tying it to the client object gets exactly that:
+        # reconnects happen inside `run()` and reuse it; a new process makes a
+        # new one.  Pass an explicit value to resume a run across a restart.
+        self.run_id = run_id or f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
         self.codec = codec
         self.jpeg_quality = jpeg_quality
         self.max_inflight = max(1, max_inflight)
@@ -2608,6 +2623,10 @@ class RoboCamClient:
         self._server_wants_scans = True
         self._server_wants_imu = True
         self._server_wants_odom = True
+        # None until the welcome says; only False is worth a warning.
+        self._server_takes_frame_pose: Optional[bool] = None
+        self._warned_frame_pose = False
+        self.frame_poses_sent = 0
         self._server_wants_map = True
         # Whether the server will send anything back for a map.  A server that
         # accepts grids but has compare disabled is one there is little point
@@ -2664,6 +2683,10 @@ class RoboCamClient:
         log.info("connecting to %s as %r", self.server, self.client_id)
         self._send({
             "type": MSG_HELLO,
+            # The run, not the session: unchanged across reconnects, new on a
+            # relaunch. The server clears everything it accumulated when it
+            # changes -- see Processor.new_run on the server side.
+            "run_id": self.run_id,
             "protocol": PROTOCOL_VERSION,
             "client_id": self.client_id,
             "codec": self.codec,
@@ -2751,9 +2774,11 @@ class RoboCamClient:
         t_status = t_start
 
         try:
-            for img, pre_encoded in source.frames():
+            for item in source.frames():
                 if self._stop:
                     break
+                img, pre_encoded = item[0], item[1]
+                frame_pose = item[2] if len(item) > 2 else None
 
                 self._drain_results()
 
@@ -2781,7 +2806,7 @@ class RoboCamClient:
                     # Server is behind. Drop this frame at the source.
                     self.skipped_backpressure += 1
                 else:
-                    self._send_frame(img, pre_encoded, cv2)
+                    self._send_frame(img, pre_encoded, cv2, pose=frame_pose)
 
                 if status_every > 0 and now - t_status >= status_every:
                     self._log_status(now - t_status)
@@ -3051,7 +3076,8 @@ class RoboCamClient:
             "t_send_ns": time.monotonic_ns(),
         })
 
-    def _send_frame(self, img: Optional[np.ndarray], pre_encoded: Optional[bytes], cv2) -> None:
+    def _send_frame(self, img: Optional[np.ndarray], pre_encoded: Optional[bytes], cv2,
+                    pose: Optional[Dict[str, Any]] = None) -> None:
         t_capture_ns = time.monotonic_ns()
 
         if pre_encoded is not None:
@@ -3087,6 +3113,14 @@ class RoboCamClient:
             "t_capture_ns": t_capture_ns,
             "t_send_ns": time.monotonic_ns(),
         }
+        if pose is not None:
+            header["pose"] = pose
+            self.frame_poses_sent += 1
+            if self._server_takes_frame_pose is False and not self._warned_frame_pose:
+                self._warned_frame_pose = True
+                log.warning("this server does not read a pose attached to a frame: it "
+                            "will place clouds with the odom stream and its configured "
+                            "camera mount, whatever the neck is doing")
         if self._send(header, payload):
             self._pending[seq] = time.monotonic()
             self.sent += 1
@@ -3168,6 +3202,7 @@ class RoboCamClient:
                 self._server_wants_odom = bool(server_odom.get("enabled", bool(server_odom)))
                 self._server_wants_map = bool(server_map.get("enabled", bool(server_map)))
                 self._server_sends_updates = bool(server_map.get("send_updates", False))
+                self._server_takes_frame_pose = bool(server_odom.get("frame_pose", False))
 
                 if self._odom_info and not self._server_wants_odom:
                     log.warning("server is not accepting odometry -- the reconstruction "

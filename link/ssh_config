@@ -17,3 +17,19 @@ Host mecanumbot-laptop
     Port 8222
     User ubuntu
     StrictHostKeyChecking accept-new
+
+# The same robot, reached from a machine that is NOT nipg1 -- a laptop off the
+# lab WiFi, or anywhere with an nipg1 login. ProxyJump makes 127.0.0.1:8200
+# resolve *on nipg1*, which is where the robot's reverse forward binds
+# (GatewayPorts defaults to no, so it binds nipg1's loopback and nowhere else).
+#
+#   MECANUMBOT_SSH_HOST=mecanumbot-jump robot web
+#   MECANUMBOT_SSH_HOST=mecanumbot-jump robot topic list
+Host mecanumbot-jump
+    HostName 127.0.0.1
+    Port 8200
+    User ubuntu
+    ProxyJump csengehubay@nipg1.inf.elte.hu
+    StrictHostKeyChecking accept-new
+    ServerAliveInterval 20
+    ServerAliveCountMax 3

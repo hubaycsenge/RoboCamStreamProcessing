@@ -270,3 +270,32 @@ def _t_map_cam(odom: Odom, mount: CameraMount) -> np.ndarray:
     t_map_base[:3, :3] = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
     t_map_base[:3, 3] = (odom.x, odom.y, odom.z)
     return t_map_base @ mount.matrix()
+
+
+# -- the robot's own camera pose -----------------------------------------------
+
+def test_the_robots_camera_pose_replaces_the_configured_mount():
+    """The mount is one tilt for the session; the neck has moved since."""
+    tilted = CameraMount(x=0.13, y=0.0, z=0.21, pitch=0.4)
+    configured = CameraMount(x=0.10, y=0.0, z=0.45)
+    odom = Odom(x=1.0, y=-1.0, yaw=0.3, frame="map", camera=tilted.matrix())
+    points = np.array([[0.1, -0.2, 2.0], [0.0, 0.0, 1.0]])
+
+    out = cloud_to_map(points, identity_pose(), odom, configured)
+    expected = cloud_to_map(points, identity_pose(),
+                            Odom(x=1.0, y=-1.0, yaw=0.3, frame="map"), tilted)
+    assert out == pytest.approx(expected)
+
+
+def test_a_camera_tilted_down_sees_the_floor_ahead_of_the_robot():
+    """Built by hand rather than from CameraMount, so the two can disagree."""
+    tilt = math.radians(45.0)        # down: a positive rotation about y
+    c, s = math.cos(tilt), math.sin(tilt)
+    t_base_optical = np.eye(4)
+    t_base_optical[:3, :3] = np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]) @ OPTICAL_TO_BODY
+    t_base_optical[:3, 3] = (0.0, 0.0, 0.2)
+    odom = Odom(x=0.0, y=0.0, yaw=0.0, frame="map", camera=t_base_optical)
+
+    along_the_lens = np.array([[0.0, 0.0, 0.2 * math.sqrt(2.0)]])
+    out = cloud_to_map(along_the_lens, identity_pose(), odom, CameraMount())
+    assert out[0] == pytest.approx([0.2, 0.0, 0.0], abs=1e-9)

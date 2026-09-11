@@ -10,8 +10,8 @@ same SSH plumbing, so both live here.
 | file | direction | what it is |
 | --- | --- | --- |
 | `robocam_client.py` | data | standalone client, deploy to the Orin. No ROS, one file. |
-| `robot` | control | run `ros2` on the robot from nipg1, over the reverse tunnel |
-| `ssh_config` | both | host aliases; `robot` reads this file directly |
+| `robot` | control | run `ros2` on the robot from nipg1, over the reverse tunnel; `robot web` also forwards its web GUI to your browser |
+| `ssh_config` | both | host aliases; `robot` reads this file directly. `mecanumbot-jump` is the same robot via `ProxyJump`, for a laptop rather than nipg1 |
 | `ros-env.sh` | control | ROS env sourced *on the robot* by the wrapper |
 | `mecanumbot-tunnel.service` | control | robot:22 → nipg1:8200, robot-side systemd |
 | `mecanumbot-deep3r-tunnel.service` | data | robot:5555 → nipg1:5555, robot-side systemd |
@@ -111,6 +111,11 @@ Four facts follow, and they shape everything here:
   server :5555 ──ssh -R──▶  :5555 (loopback)  ◀──ssh -L── robocam_client.py
   run_deep3r_bridged.sh      the rendezvous     mecanumbot-deep3r-tunnel.service
                                                        → tcp://127.0.0.1:5555
+
+  your browser                 nipg1                    Mecanumbot
+  ────────────                 ─────                    ──────────
+  localhost:8080 ──ssh -L over the control tunnel──▶ web GUI :8080
+  `robot web`                (nothing permanent; open while the command runs)
 ```
 
 Both halves bind nipg1's loopback (sshd's `GatewayPorts` defaults to `no`), so
@@ -122,10 +127,42 @@ they meet on that one port and neither end needs the other's address.
     robot topic list           # ros2 is implied
     robot topic echo /mecanumbot/scan
     robot status               # is the tunnel up? prints the topic count
+    robot web                  # the robot's web GUI in your own browser
     robot grippers close       # helper: close grippers (neck held at 6.5)
     robot grippers open        # helper: open grippers (neutral 5.12)
     robot pub-accessory 6.5 6.83 3.36     # raw {n_pos, gl_pos, gr_pos}
     robot raw 'ros2 param list /mecanumbot/mecanumbot_joy_node'
+
+### The web GUI from outside the lab
+
+`robot web` forwards the robot's GUI to `http://localhost:8080` and holds it
+open until you Ctrl-C. From a laptop rather than nipg1:
+
+    MECANUMBOT_SSH_HOST=mecanumbot-jump robot web
+
+**The node was always running; there was just no way to reach it.** The GUI
+starts with the base launch — `use_web` defaults true and nothing in the T1 path
+turns it off — and serves on the robot's `0.0.0.0:8080`. On the lab WiFi you
+open `http://192.168.{0,1}.240:8080` and it is there. Through this directory's
+tunnels it was not, because they carry exactly two ports across the boundary,
+22 and 5555, and 8080 is neither. nipg1 has no route to the robot's LAN at all,
+so the page simply did not answer — which looks exactly like the node having
+failed to start, and is why it was read that way.
+
+`robot web` adds nothing permanent. It opens an `ssh -L` over the control tunnel
+that already exists, for as long as the command runs. That is on purpose, and
+the alternative — a third systemd unit beside the control and data ones — was
+rejected for two reasons:
+
+- The control unit sets `ExitOnForwardFailure=yes`. Adding a second `-R` to it
+  means a stale GUI forward left on nipg1 takes **SSH to the robot** down with
+  it, and that tunnel is the lifeline you would need to fix it.
+- The GUI has no login, and it can drive the robot and start behaviour trees. A
+  permanent forward leaves that standing open on a shared login node's loopback
+  for as long as the robot is powered. On demand, bound to your own loopback, it
+  is open while you are looking at it and gone afterwards.
+
+Pass a different local port if 8080 is taken: `robot web 8081`.
 
 Put it on your PATH if you like:
 
@@ -169,9 +206,39 @@ public half is missing:
     sed 's/^/restrict,port-forwarding /' ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
     chmod 600 ~/.ssh/authorized_keys
 
-Check it took — this must print `nipg1` and not prompt:
+If `~/.ssh/id_ed25519.pub` does not exist, make the pair first — there is
+nothing to authorize otherwise:
+
+    ssh-keygen -t ed25519 -N ""
+
+Check it took — this must print `ok` and not prompt:
 
     ssh -o BatchMode=yes nipg1.inf.elte.hu true && echo ok
+
+Two lines like these may appear alongside the `ok`, and are **not** a failure:
+
+    hostfile_replace_entries: link .../known_hosts to .../known_hosts.old: No such file or directory
+    update_known_hosts: hostfile_replace_entries failed for .../known_hosts: ...
+
+Home is on the NAS, which does not support the hardlink ssh uses to rotate
+`known_hosts`. It is the bookkeeping complaining, not the authentication, and it
+only fires on the connection that adds a new host entry. `ok` is the part that
+matters.
+
+**Skipping this step is the most common way `run_deep3r_bridged.sh` fails**, and
+it fails after the server has already started and bound, so the run looks
+half-alive:
+
+    server is listening on :5555
+    bridged: robot -> nipg1.inf.elte.hu:5555 -> nipg4:5555
+    csengehubay@nipg1.inf.elte.hu: Permission denied (publickey).
+    --- reverse tunnel to nipg1.inf.elte.hu:5555 dropped (exit 255) ---
+
+`Permission denied (publickey)` is this step and nothing else. The script names
+the cause it read out of ssh's own output, so take that over guessing — in
+particular it is *not* the stale-port case, and going to hunt a held forward on
+nipg1 is a wasted trip. The Slurm allocation survives the failure; fix the key
+and re-run the `srun` against the same job id.
 
 (The wrapper reads `ssh_config` from this directory, so there is no ssh config to
 wire beyond this.)
@@ -224,6 +291,11 @@ Run them as user services with linger (one sudo, for linger only):
   other cluster users unless they share this account. 5555 in particular is an
   unauthenticated ZeroMQ endpoint, so keep it off `0.0.0.0` on nipg1 — do not
   add `GatewayPorts` or a `*:5555` bind to make it "easier to test".
+- The robot's web GUI is **not** forwarded permanently, and should not be: it
+  has no login, and anything that reaches port 8080 can drive the robot and
+  start a behaviour tree. `robot web` opens it over the existing control tunnel
+  on demand and binds your own loopback (`ssh -L` does that unless you add
+  `-g` — do not). Close it when you are done by stopping the command.
 - The deep3r tunnel no longer targets nipg36, so it no longer needs your
   unrestricted cluster key: pointed at nipg1, it reuses the robot's existing
   restricted key. That removes the shell-on-nipg36 exposure the previous version

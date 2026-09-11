@@ -266,6 +266,10 @@ class Deep3RProcessor(Processor):
 
         # The recurrent state, and the bookkeeping that decides when to drop it.
         self._state: Optional[Tuple[Any, ...]] = None
+        #: Run this processor's accumulated state belongs to.  A change wipes
+        #: it; see `new_run`.  Empty until the first frame that names one, so
+        #: the first run of a fresh server does not report itself as a reset.
+        self._run_id = ""
         self._frames_in_state = 0
         self._last_seq: Optional[int] = None
         self._map_id = 0
@@ -434,6 +438,39 @@ class Deep3RProcessor(Processor):
         rope.forward = forward
         rope._deep3r_patched = True
 
+    def new_run(self, run_id: str) -> None:
+        """Forget everything the previous run left behind.
+
+        Four stores, and every one of them would be wrong for a new run rather
+        than merely stale:
+
+        * the **recurrent state** -- CUT3R's world frame is anchored on the
+          first frame it ever saw, so a new robot pass folded into the old
+          state is reconstructed into a coordinate frame belonging to a room
+          the robot may not even be in;
+        * the **keyframes** -- T2's retro-search would find the target in an
+          image from the last run and hand the robot a coordinate in that run's
+          map frame, which is the most convincing way this system can be wrong;
+        * the **remembered target** -- same, without even an image behind it;
+        * the **sequence counter**, because the next run starts from zero and a
+          backwards jump is not a gap.
+
+        ``map_id`` is bumped rather than reset, so the robot can tell "new run"
+        from "same run, same map" by the identity it already watches.
+        """
+        self._reset_state()
+        if self._keyframes is not None:
+            self._keyframes.clear()
+        self._memory = seek_mod.TargetMemory(
+            ttl_s=(self._seek_cfg.memory_ttl_s if self._seek_cfg else 900.0))
+        self._recall_target = ""
+        self._recall_queue = []
+        self._last_announced = None
+        self._prev_phase = wire.PHASE_EXPLORE
+        self._last_seq = None
+        log.info("new run %s: reconstruction, keyframes and target memory cleared "
+                 "(map_id now %d)", run_id or "<unnamed>", self._map_id)
+
     def close(self) -> None:
         self._state = None
         self._model = None
@@ -464,6 +501,21 @@ class Deep3RProcessor(Processor):
             self._lock.release()
 
     def _process_locked(self, frame: Frame) -> Dict[str, Any]:
+        # A new run wipes before anything else looks at this frame.  Done here,
+        # on the worker thread and between frames, rather than from the IO
+        # thread on `hello`: the state being cleared is the one `process` is
+        # about to fold this frame into, and clearing it from another thread
+        # mid-inference is the kind of race that produces a reconstruction
+        # nothing looks wrong with.
+        #
+        # An empty run_id means the client cannot say, and is deliberately not
+        # a wipe -- a v1 client, or one predating the field, must not have its
+        # reconstruction thrown away on every reconnect.
+        if frame.run_id and frame.run_id != self._run_id:
+            if self._run_id:
+                self.new_run(frame.run_id)
+            self._run_id = frame.run_id
+
         self._seen += 1
         gap = 0 if self._last_seq is None else int(frame.seq) - self._last_seq
         self._last_seq = int(frame.seq)
@@ -887,6 +939,10 @@ class Deep3RProcessor(Processor):
         stats = dict(result.stats)
         stats["ran"] = bool(result.stats.get("placed"))
         stats["odom_age_ms"] = round(frame.odom_age_ms, 1)
+        # Which camera pose placed this cloud: the robot's for this frame, or
+        # the configured mount.  The first thing to check when a tilted head
+        # produces an agreement near zero.
+        stats["camera_from"] = "robot" if frame.odom.camera is not None else "config"
         stats["grid_age_ms"] = round(frame.grid_age_ms, 1)
 
         patch = result.patch

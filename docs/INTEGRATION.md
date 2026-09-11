@@ -375,6 +375,34 @@ problems with two different answers: drive around it, or go and tell somebody.
 
 ---
 
+## Where the camera was, per frame
+
+**Status: BUILT (2026-09-11), unvalidated on the robot.** `T_map_cloud` is
+`T_map_base · T_base_cam · T_cut3r_cam⁻¹`, and the first two used to come from
+the odom stream's latest pose and one fixed `compare.camera_*` mount. Neither
+holds on the Mecanumbot while it moves: the stream pose is paired by arrival, and
+the camera is on a neck the fetch tree sweeps. A frame may now carry its own
+`pose`, with a `camera` block, and the server prefers both
+(`odometry.decode_frame_pose`, `StreamServer._pose_for_frame`).
+
+On the robot, `mecanumbot_deep3r` fills it: the base from TF at the image's
+stamp, the camera from a neck model rather than TF, because the URDF's head and
+camera links are rotated for the meshes and in TF the camera looks sideways at
+every neck angle. Its README has the model and the two assumptions still
+unmeasured — the lens tilt at the level neck position, and that `pos_n` is the
+neck's goal rather than its measured position.
+
+What to watch: `data.compare.camera_from` (`robot` or `config`) and the result's
+`pose_source`. Once a session has sent a camera pose, a frame without one is not
+placed, so a run whose `odom_seq` disappears from results mid-way is a robot
+that lost its neck reading or its TF, not a server fault.
+
+The configured mount's `camera_z: 0.45` disagrees with every measurement of this
+robot (perception's 0.21, the URDF's ~0.2). It is now only a fallback, but a
+robot that sends no camera pose is placed 24 cm too high by it.
+
+---
+
 ## The plan
 
 Items 1–3 stand between the current state and a system that runs end to end.

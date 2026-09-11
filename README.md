@@ -428,6 +428,14 @@ of those was attached to the frame. Their **absence is the signal**: no
 the robot's map frame, which is a different thing from a comparison that ran and
 found nothing.
 
+A `frame` header may carry a `pose`: the robot's pose when that image was taken,
+in `odom` header fields plus `age_ms`, and optionally a `camera` block giving the
+camera's optical frame relative to the base. The server places that frame with it
+instead of the odom stream's latest and `compare.camera_*` (see
+`robocam.wire.frame`), and the result says `"pose_source": "frame"` rather than
+`"stream"`. Once a session has sent a camera pose, a frame without one is not
+placed. The welcome advertises support as `server.odom.frame_pose`.
+
 **Clocks are never compared across machines.** The Orin and the server have
 unrelated monotonic clocks, so `t_capture_ns` and `t_send_ns` are echoed back
 untouched and the client computes `rtt_ms` against its own clock. `server_ms` is
@@ -706,6 +714,34 @@ Not yet measured on nipg36's TITAN RTX (sm_75); expect it to be slower. That
 number used to matter because the robot was pinned to nipg36. It no longer is —
 the job can land on any node — so nipg36's figure is now a curiosity rather than
 the number the robot lives with.
+
+### A new run wipes it
+
+The server is a Slurm job held for hours; the robot restarts many times inside
+that. So the reconstruction, the T1 keyframes and the remembered target are
+cleared whenever a robot announces a **run** this server has not seen.
+
+Without it, a relaunched robot folds its first frames into the previous run's
+recurrent state — reconstructing a new pass into a world frame anchored on a
+room it may have left — and T2's retro-search can find the target in a keyframe
+from the last run and return a coordinate in *that* run's map frame. Both are
+wrong with full confidence, which is the worst way this system can fail.
+
+`run_id` rides in `hello` and is **minted once per client process**, and that is
+the whole design: a dropped tunnel and the reconnect after it carry the same id
+and wipe nothing, because throwing away a good scan over a WiFi blip is a worse
+failure than keeping a stale one. A relaunched robot is a new process and gets a
+clean slate. An empty `run_id` — a v1 client, or one predating the field — means
+"cannot tell" and never wipes.
+
+The check runs on the **worker thread**, at the top of the frame that carries the
+new id, not on the IO thread when `hello` arrives: the state being cleared is the
+one that frame is about to be folded into, and clearing it from another thread
+mid-inference is the kind of race that leaves a reconstruction nothing looks
+wrong with.
+
+To resume a run across a robot restart, pass the previous id:
+`ros2 launch mecanumbot_deep3r deep3r.launch.py` with `run_id:=<the old one>`.
 
 ### State is the map
 

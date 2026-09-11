@@ -10,6 +10,7 @@
 #   robot grippers close|open  helper: close/open grippers (neck held at 6.5)
 #   robot raw '<cmd>'          run an arbitrary remote command, ROS 2 sourced
 #   robot status               is the tunnel up? show the topic count
+#   robot web [port]           open the robot's web GUI in your own browser
 set -euo pipefail
 # Resolve ssh_config next to this script rather than through an Include line in
 # ~/.ssh/config. That Include hard-codes a path, so moving this directory
@@ -25,6 +26,40 @@ case "${1:-}" in
     exec "${SSH[@]}" -t "$HOST" "$ENV"$'\n''exec bash -i' ;;
   raw)
     shift; q=$(printf '%q ' "$@"); exec "${SSH[@]}" "$HOST" "$ENV; $q" ;;
+  web)
+    # The web GUI runs on the robot whenever the base launch does -- use_web
+    # defaults true and nothing in the T1 path turns it off -- but port 8080 is
+    # not one of the two ports this directory forwards across the boundary. On
+    # the lab WiFi you reach it at http://<robot>:8080 directly; from nipg1 or
+    # anywhere else there is no route to the robot's LAN at all, so the page is
+    # simply unreachable and it looks like the node did not start.
+    #
+    # This forwards it over the SSH session that already exists, for as long as
+    # you keep the command running. Deliberately on demand rather than a third
+    # systemd unit next to the other two:
+    #
+    #   * the control unit sets ExitOnForwardFailure=yes, so adding a second -R
+    #     to it would let a stale GUI forward on nipg1 take SSH to the robot
+    #     down with it -- and that tunnel is the lifeline;
+    #   * the GUI has no login and can drive the robot and start behaviour
+    #     trees, so a permanent forward would leave it standing open on a
+    #     shared login node's loopback for as long as the robot is powered.
+    #
+    # Bound to your own loopback only (ssh -L does that by default; do not add
+    # -g), so nobody else reaches it even on a shared machine.
+    port="${2:-8080}"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+      echo "usage: robot web [local-port]   (default 8080)" >&2; exit 2
+    fi
+    if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then
+      echo "local port $port is already in use -- pick another: robot web 8081" >&2
+      exit 1
+    fi
+    echo "forwarding http://localhost:$port  ->  the robot's web GUI on :8080"
+    echo "  (via $HOST; Ctrl-C closes it. The GUI has no login -- this is bound"
+    echo "   to your loopback only.)"
+    exec "${SSH[@]}" -N -L "${port}:127.0.0.1:8080" \
+      -o ExitOnForwardFailure=yes "$HOST" ;;
   status)
     if n=$("${SSH[@]}" -o ConnectTimeout=6 "$HOST" "$ENV; timeout 6 ros2 topic list 2>/dev/null | wc -l" 2>/dev/null) && [ "${n:-0}" -gt 2 ]; then
       echo "tunnel UP — $n topics visible on the robot"

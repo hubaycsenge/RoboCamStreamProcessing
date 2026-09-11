@@ -76,6 +76,13 @@ class Odom:
     # association is measured against this and never against a client clock.
     recv_ts_ns: int = 0
     summary: Dict[str, Any] = field(default_factory=dict)
+    #: ``T_child_optical``: where the camera was relative to ``child_frame`` for
+    #: the one frame this pose was attached to, when the robot said.  It takes
+    #: the place of the configured :class:`robocam.compare.CameraMount`, and
+    #: exists because the Mecanumbot's camera is on a neck that moves.  None on
+    #: every stream pose; see :func:`decode_frame_pose`.
+    camera: Optional[np.ndarray] = None
+    camera_source: str = ""
 
     @property
     def xy(self) -> Tuple[float, float]:
@@ -199,6 +206,94 @@ def decode_odom(header: Dict[str, Any], recv_ts_ns: int = 0) -> Odom:
         source=str(header.get("source", "")),
         recv_ts_ns=recv_ts_ns,
     )
+
+
+#: A camera further than this from the base frame's origin is not on the robot.
+#: The Mecanumbot's is about 25 cm from ``base_link``; two metres leaves room for
+#: any mast and still catches millimetres sent as metres.
+MAX_CAMERA_OFFSET_M = 2.0
+
+
+def _matrix_from_quaternion(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+    ], dtype=np.float64)
+
+
+def decode_camera(block: Dict[str, Any], base_frame: str) -> np.ndarray:
+    """Turn a pose's ``camera`` block into the 4x4 ``T_base_optical``.
+
+    This is the matrix :meth:`robocam.compare.CameraMount.matrix` would return,
+    supplied by the robot for one frame instead of by the config for all of
+    them.  It is held to the same convention: the child frame is **optical** (x
+    right, y down, z forward), and no flip is applied here, because the robot
+    has already applied it.
+
+    ``frame`` must name the base the pose itself names.  An extrinsic measured
+    from ``base_footprint`` composed onto a ``base_link`` pose is a centimetre
+    out on this robot and arbitrarily out on another, and nothing downstream
+    could tell, so a mismatch is refused rather than assumed away.
+    """
+    if not isinstance(block, dict):
+        raise OdomError(f"camera is {type(block).__name__}, expected an object")
+    frame = str(block.get("frame", "") or "")
+    if frame != base_frame:
+        raise OdomError(
+            f"camera pose is relative to {frame!r} but the pose is of {base_frame!r}; "
+            "the two cannot be composed")
+    try:
+        values = [float(block[k]) for k in ("x", "y", "z", "qw", "qx", "qy", "qz")]
+    except KeyError as exc:
+        raise OdomError(f"camera pose is missing {exc.args[0]!r}") from exc
+    except (TypeError, ValueError) as exc:
+        raise OdomError(f"camera pose is not numeric: {exc}") from exc
+    if not all(math.isfinite(v) for v in values):
+        raise OdomError(f"camera pose is not finite: {values}")
+    x, y, z, qw, qx, qy, qz = values
+    if math.sqrt(x * x + y * y + z * z) > MAX_CAMERA_OFFSET_M:
+        raise OdomError(
+            f"camera is {math.sqrt(x * x + y * y + z * z):.1f} m from {base_frame!r}, "
+            f"beyond the {MAX_CAMERA_OFFSET_M:.0f} m a camera on the robot can be")
+    norm = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    if norm < 1e-6:
+        raise OdomError(f"camera quaternion has norm {norm}, which is not a rotation")
+    out = np.eye(4)
+    out[:3, :3] = _matrix_from_quaternion(qw / norm, qx / norm, qy / norm, qz / norm)
+    out[:3, 3] = (x, y, z)
+    return out
+
+
+def decode_frame_pose(pose: Any, seq: int = -1, recv_ts_ns: int = 0) -> Tuple[Odom, float]:
+    """Decode the pose a robot attached to one frame, and how old it was.
+
+    The odom stream is paired with frames by arrival on this server, so the
+    pose a frame gets from it is whichever arrived last -- up to one pose period
+    away from the instant the image was taken, and blind to anything that moved
+    the camera but not the base.  A robot that knows better attaches the pose to
+    the frame itself.  It goes through :func:`decode_odom`, so it meets every
+    check a stream pose does, plus the ``camera`` block when there is one.
+
+    The age is the robot's own figure for how far the newest input it used is
+    from the image's timestamp, measured on its clock and reported, never
+    compared with this server's.
+    """
+    if not isinstance(pose, dict):
+        raise OdomError(f"frame pose is {type(pose).__name__}, expected an object")
+    header = dict(pose)
+    header.setdefault("seq", seq)
+    odom = decode_odom(header, recv_ts_ns=recv_ts_ns)
+    try:
+        age_ms = abs(float(pose.get("age_ms", 0.0) or 0.0))
+    except (TypeError, ValueError) as exc:
+        raise OdomError(f"age_ms is not numeric: {exc}") from exc
+    if not math.isfinite(age_ms):
+        raise OdomError(f"age_ms is {age_ms}")
+    if pose.get("camera") is not None:
+        odom.camera = decode_camera(pose["camera"], base_frame=odom.child_frame)
+        odom.camera_source = str(pose["camera"].get("source", "") or "robot")
+    return odom, age_ms
 
 
 def analyse(odom: Odom, previous: Optional[Odom] = None,

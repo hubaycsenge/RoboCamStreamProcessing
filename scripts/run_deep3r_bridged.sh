@@ -114,35 +114,87 @@ echo "server is listening on :${LOCAL_PORT}"
 
 # Reverse forward, kept up for as long as the server runs. ExitOnForwardFailure
 # makes a refused bind fatal rather than silent -- see the stale-port note below.
-tunnel_loop() {
-    while kill -0 "$SERVER_PID" 2>/dev/null; do
-        ssh -NT \
-            -o ExitOnForwardFailure=yes \
-            -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-            -o StrictHostKeyChecking=accept-new \
-            -o BatchMode=yes \
-            -R "${BRIDGE_PORT}:127.0.0.1:${LOCAL_PORT}" "$BRIDGE_HOST" || {
-            rc=$?
-            cat >&2 <<MSG
+# The two ways this fails need two different fixes, and ssh already says which
+# it is -- so read its stderr and print the one that applies rather than a menu
+# of both. Guessing wrong here costs real time: the port advice sends you to
+# nipg1 to hunt a stale forward that is not there, while the actual problem is
+# one command long.
+TUNNEL_ERR="$(mktemp)"
+trap 'rm -f "$TUNNEL_ERR"' EXIT
 
---- reverse tunnel to ${BRIDGE_HOST}:${BRIDGE_PORT} dropped (exit ${rc}) ---
-If this repeats immediately, the usual cause is that port ${BRIDGE_PORT} on
-${BRIDGE_HOST} is still held by a previous job's forward. sshd will not rebind
-it and ExitOnForwardFailure makes that fatal here rather than leaving you with a
-tunnel that goes nowhere. On nipg1:
+diagnose_tunnel() {
+    local rc="$1" err
+    err="$(cat "$TUNNEL_ERR" 2>/dev/null || true)"
+    [[ -n "$err" ]] && printf '%s\n' "$err" >&2
+
+    echo >&2
+    echo "--- reverse tunnel to ${BRIDGE_HOST}:${BRIDGE_PORT} dropped (exit ${rc}) ---" >&2
+
+    if grep -qi 'permission denied' <<<"$err"; then
+        cat >&2 <<MSG
+AUTHENTICATION. ${BRIDGE_HOST} refused this node's key, so the forward never
+opened. Home is shared over the NAS, so the private half of the key is already
+here -- what is missing is the public half in nipg1's own authorized_keys.
+
+Fix it once, ON NIPG1:
+
+  sed 's/^/restrict,port-forwarding /' ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+
+(\`restrict,port-forwarding\` because forwarding is all this key ever needs to
+do -- no shell, no pty. If ~/.ssh/id_ed25519.pub does not exist, make the pair
+first with \`ssh-keygen -t ed25519 -N ""\`.)
+
+Then re-run the srun; the allocation is still yours and does not need redoing.
+The job id is interpolated below on purpose -- you will be pasting this into a
+login shell, where \$SLURM_JOB_ID is empty because it is only set inside a job
+step, and \`--jobid=\` with nothing after it becomes job 0:
+
+  srun --jobid=${SLURM_JOB_ID} --overlap ./scripts/run_deep3r_bridged.sh
+MSG
+    elif grep -qiE 'remote port forwarding failed|cannot listen to port' <<<"$err"; then
+        cat >&2 <<MSG
+PORT ALREADY HELD. Port ${BRIDGE_PORT} on ${BRIDGE_HOST} is still bound by an
+earlier job's forward. sshd will not rebind it, and ExitOnForwardFailure makes
+that fatal here rather than leaving a tunnel that goes nowhere. On nipg1:
 
   ss -ltnp | grep ${BRIDGE_PORT}      # find the stale sshd/ssh holding it
   kill <pid>
 
-Or run this job against a different port on both ends:
+Or use a different port at both ends:
   DEEP3R_BRIDGE_PORT=5556 ./scripts/run_deep3r_bridged.sh
 (and point the robot's tunnel at 5556 to match).
-
-The other cause is authentication: nipg1's key must be in nipg1's
-authorized_keys. See the header of this script.
 MSG
-            sleep 5
-        }
+    else
+        cat >&2 <<MSG
+Neither authentication nor a held port, by ssh's own account. The two usual
+causes and their fixes are in the header of this script; the ssh output above is
+the thing to read first.
+MSG
+    fi
+}
+
+tunnel_loop() {
+    local backoff=5
+    while kill -0 "$SERVER_PID" 2>/dev/null; do
+        if ssh -NT \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+            -o StrictHostKeyChecking=accept-new \
+            -o BatchMode=yes \
+            -R "${BRIDGE_PORT}:127.0.0.1:${LOCAL_PORT}" "$BRIDGE_HOST" \
+            2>"$TUNNEL_ERR"; then
+            # A clean exit means the far end went away; retry promptly.
+            backoff=5
+        else
+            diagnose_tunnel "$?"
+            # Back off. A misconfigured key fails instantly and identically for
+            # ever, and hammering it four times a second buries the diagnosis
+            # under copies of itself -- which is exactly how this looked the
+            # first time it happened.
+            echo "retrying in ${backoff}s (Ctrl-C to stop)" >&2
+            sleep "$backoff"
+            (( backoff = backoff < 60 ? backoff * 2 : 60 ))
+        fi
     done
 }
 tunnel_loop &

@@ -294,7 +294,11 @@ class CompareConfig:
     # One verdict per this many milliseconds.  The reconstruction runs at ~6 Hz;
     # the robot's exploration decides things at walking pace, and a verdict it
     # has not acted on yet is one that will be measured again.
-    min_agreement_interval_ms: float = 1000.0
+    # 1 Hz was the first guess and it was too fast: the robot's exploration
+    # decides where to drive at walking pace, and each verdict makes it
+    # re-evaluate its keepouts and its revisit list. 3 s is still several
+    # verdicts per goal.
+    min_agreement_interval_ms: float = 3000.0
     # Side of the square the disagreement is pooled into before clustering, in
     # metres.  Regions are places to drive to, so this is roughly the smallest
     # thing worth a detour; below about 0.3 m the list fills with reconstruction
@@ -305,7 +309,11 @@ class CompareConfig:
     region_min_cells: int = 3
     # Cap on the region list.  It rides in an announcement on the same socket as
     # the frames, and the lowest-scoring are what the cap drops.
-    max_regions: int = 32
+    # 32 was a cap, not a considered number. The robot interleaves one revisit
+    # goal per `uncertain_every` frontier goals, so a list far longer than the
+    # goals it will ever service is churn with no benefit -- and the low-scoring
+    # tail is exactly what changes between verdicts.
+    max_regions: int = 12
 
     def __post_init__(self) -> None:
         if self.z_min >= self.z_max:

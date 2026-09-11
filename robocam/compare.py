@@ -31,7 +31,9 @@ orientation nobody chose.  What relates them is the camera pose, known in both:
     T_map_cut3r  =  T_map_base · T_base_cam · (T_cut3r_cam)⁻¹
 
 ``T_map_base`` is the odometry pose that arrived with the frame, ``T_base_cam``
-is where the camera is bolted (config, not guessable), and ``T_cut3r_cam`` is the
+is where the camera is (the robot's own figure for that frame when it sends one,
+since the Mecanumbot's camera is on a neck; the config otherwise, as nothing
+else can guess it), and ``T_cut3r_cam`` is the
 pose the model returned with the cloud.  Get any of the three wrong and the cloud
 lands somewhere plausible and false, which is why :func:`compare` reports
 ``agreement`` — the share of cloud surface that coincides with mapped obstacle —
@@ -164,7 +166,10 @@ def map_from_cloud_matrix(pose_c2w: np.ndarray, odom: Odom,
     t_map_base[:3, :3] = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
     t_map_base[:3, 3] = (odom.x, odom.y, odom.z)
 
-    t_map_cam = t_map_base @ mount.matrix()
+    # The robot's per-frame camera pose wins over the configured mount: a mount
+    # is one tilt for the whole session, and a neck that swept since is not at it.
+    t_base_cam = odom.camera if odom.camera is not None else mount.matrix()
+    t_map_cam = t_map_base @ t_base_cam
     return t_map_cam @ invert_rigid(pose_c2w)
 
 
