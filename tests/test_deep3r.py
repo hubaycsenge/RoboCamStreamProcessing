@@ -1180,12 +1180,28 @@ def test_a_colourful_frame_reports_chroma():
     assert "lost it after this point" in out["note"]
 
 
+def test_a_nearly_black_frame_is_reported_as_dark_not_grey():
+    """The case the 2026-09-17 cloud actually was: values of 0, 2, 3, 30/255.
+
+    Near-black points with a little variation render exactly like a dim
+    greyscale cloud, so the two have to be separated by a number rather than
+    by looking at RViz.
+    """
+    proc = make_proc()
+    proc._view_rgb = np.array([[[0, 0, 2], [7, 12, 30]]], np.uint8)
+    out = proc._colour_check()
+    assert out["dark"] is True
+    assert out["grey"] is False           # it has chroma, it just has no light
+    assert "exposure or the camera" in out["note"]
+
+
 def test_a_grey_frame_says_so():
     """The case the robot cannot see: every channel equal, at any brightness."""
     proc = make_proc()
     proc._view_rgb = np.dstack([np.full((4, 4), 200, np.uint8)] * 3)
     out = proc._colour_check()
     assert out["grey"] is True
+    assert out["dark"] is False
     assert out["chroma"] == 0.0
     assert "the picture is" in out["note"]
 

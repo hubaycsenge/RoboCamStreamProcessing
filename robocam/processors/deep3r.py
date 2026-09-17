@@ -1288,26 +1288,45 @@ class Deep3RProcessor(Processor):
         checkable there; the third is not visible from that end at all, and
         chasing it cost a lot of looking at the wrong code.
 
+        Two numbers, because the cloud can lose its colour in two unrelated
+        ways and they need telling apart:
+
         ``chroma`` is the mean per-pixel spread between the largest and
         smallest channel.  It is 0 for any grey image however bright, and runs
-        to tens for an ordinary indoor scene, so the two cases are not close
-        enough to confuse.
+        to tens for an ordinary indoor scene.
+
+        ``brightness`` is the mean channel value.  A cloud whose points are all
+        near ``0x000000`` is not a *grey* picture, it is a **dark** one, and
+        the two look identical once RViz has drawn them: near-black points with
+        a little variation read as a dim greyscale cloud either way.  A real
+        cloud sampled on 2026-09-17 carried values of 0, 2, 3 and 30 out of
+        255, which is this case and not the other.
         """
         if self._view_rgb is None:
             return None
         view = self._view_rgb.astype(np.int16)
         chroma = float(np.mean(view.max(axis=2) - view.min(axis=2)))
+        brightness = float(np.mean(view))
+        grey = chroma < 1.0
+        dark = brightness < 16.0
+        if dark:
+            note = ("the source frame is nearly black, so the points are too; "
+                    "this is exposure or the camera, not the cloud")
+        elif grey:
+            note = ("the source frame has no colour; the cloud is grey because "
+                    "the picture is, not because the cloud lost it")
+        else:
+            note = ("the source frame is lit and coloured, so a grey or black "
+                    "cloud lost it after this point")
         return {
             "chroma": round(chroma, 2),
-            # Not a threshold anything acts on -- a label for the log, so that
-            # "the camera is sending grey" is a thing the reply says rather
+            "brightness": round(brightness, 2),
+            # Not thresholds anything acts on -- labels for the log, so that
+            # "the camera is sending black" is a thing the reply says rather
             # than a thing somebody has to infer from a screenshot.
-            "grey": bool(chroma < 1.0),
-            "note": ("the source frame has no colour; the cloud is grey because "
-                     "the picture is, not because the cloud lost it"
-                     if chroma < 1.0 else
-                     "the source frame has colour, so a grey cloud lost it "
-                     "after this point"),
+            "grey": bool(grey),
+            "dark": bool(dark),
+            "note": note,
         }
 
     def _scale_check(self, frame: Frame, pts, conf, pose_c2w) -> Optional[Dict[str, Any]]:
