@@ -241,6 +241,8 @@ class Deep3RProcessor(Processor):
         self._keyframes: Optional[seek_mod.KeyframeStore] = None
         self._memory = seek_mod.TargetMemory()
         self._view_geometry = seek_mod.ViewGeometry()
+        #: The cropped view's pixels, and what the point colours are.
+        self._view_rgb = None
         # What the retro-search over T1's keyframes has left to do.  Non-empty
         # only between entering t2 and either finding the target or running out
         # of stored frames; drained a few frames at a time so the search never
@@ -577,6 +579,8 @@ class Deep3RProcessor(Processor):
             "infer_ms": round(infer_ms, 1),
             "encode_ms": round(encode_ms, 1),
         }
+        if self.colors:
+            data["colour"] = self._colour_check()
         if self.lidar_check:
             data["scale_check"] = self._scale_check(frame, pts, conf, pose_c2w)
         if self.compare_map:
@@ -1072,6 +1076,21 @@ class Deep3RProcessor(Processor):
             out_w=W2, out_h=H2, src_w=W1, src_h=H1,
         )
 
+        # The point colours, taken here rather than recovered from the
+        # normalised tensor later. `pts3d_in_self_view` is one point per pixel
+        # of exactly this image, so this array and that pointmap share a
+        # raster and a length by construction.
+        #
+        # It used to be `0.5 * (view["img"] + 1.0)` after the forward pass,
+        # which is only the inverse of ImgNorm if ImgNorm is still
+        # Normalize(0.5, 0.5) -- an upstream constant this file does not own --
+        # and only reads the input at all if the model left `view["img"]`
+        # alone, which is not part of any contract either. Both assumptions
+        # fail the same way: silently, into a cloud whose colours are wrong or
+        # equal across channels. Reading the pixels costs nothing and assumes
+        # nothing.
+        self._view_rgb = np.asarray(img, dtype=np.uint8)
+
         tensor = self._img_norm(img)[None]
         return {
             "img": tensor,
@@ -1132,9 +1151,8 @@ class Deep3RProcessor(Processor):
 
             rgb = None
             if self.colors:
-                # ImgNorm maps to [-1, 1]; this is its exact inverse.
-                rgb = (0.5 * (view["img"].permute(0, 2, 3, 1) + 1.0)).clamp(0, 1)
-                rgb = (rgb * 255).to(torch.uint8).cpu().numpy().reshape(-1, 3)
+                # The pixels of the view, in the pointmap's own raster order.
+                rgb = self._view_rgb.reshape(-1, 3)
 
         return (pts_world.float().cpu().numpy().reshape(-1, 3),
                 rgb,
@@ -1260,6 +1278,37 @@ class Deep3RProcessor(Processor):
         return pts[pick], (rgb[pick] if rgb is not None else None), conf[pick]
 
     # -- sanity --------------------------------------------------------------
+
+    def _colour_check(self) -> Optional[Dict[str, Any]]:
+        """Say whether the frame this cloud was coloured from had any colour in it.
+
+        A grey point cloud has three possible causes that look identical at the
+        robot: the colours were dropped on the wire, the colours were packed
+        wrongly, or **the picture itself was grey**.  The first two are
+        checkable there; the third is not visible from that end at all, and
+        chasing it cost a lot of looking at the wrong code.
+
+        ``chroma`` is the mean per-pixel spread between the largest and
+        smallest channel.  It is 0 for any grey image however bright, and runs
+        to tens for an ordinary indoor scene, so the two cases are not close
+        enough to confuse.
+        """
+        if self._view_rgb is None:
+            return None
+        view = self._view_rgb.astype(np.int16)
+        chroma = float(np.mean(view.max(axis=2) - view.min(axis=2)))
+        return {
+            "chroma": round(chroma, 2),
+            # Not a threshold anything acts on -- a label for the log, so that
+            # "the camera is sending grey" is a thing the reply says rather
+            # than a thing somebody has to infer from a screenshot.
+            "grey": bool(chroma < 1.0),
+            "note": ("the source frame has no colour; the cloud is grey because "
+                     "the picture is, not because the cloud lost it"
+                     if chroma < 1.0 else
+                     "the source frame has colour, so a grey cloud lost it "
+                     "after this point"),
+        }
 
     def _scale_check(self, frame: Frame, pts, conf, pose_c2w) -> Optional[Dict[str, Any]]:
         """Compare the cloud's forward depth with the LiDAR's forward range.

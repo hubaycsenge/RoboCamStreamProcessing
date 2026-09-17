@@ -1150,3 +1150,45 @@ def test_a_detector_that_raises_does_not_kill_the_session():
     assert stats["ran"] is True
     assert "detect_error" in stats
     assert f.announcements == []
+
+
+# -- point colours ------------------------------------------------------------
+#
+# A grey cloud has three causes that look identical at the robot: the colours
+# were dropped on the wire, packed wrongly, or the picture was grey to begin
+# with. Only the last is invisible from that end, so the server says it.
+
+def test_colours_are_the_views_pixels_not_a_denormalised_tensor():
+    """The colours must not depend on ImgNorm's constants staying what they are.
+
+    They used to be recovered with `0.5 * (img + 1.0)`, which is the inverse of
+    ImgNorm only while ImgNorm is Normalize(0.5, 0.5) -- a constant upstream of
+    this file -- and only reads the input at all while the model leaves
+    `view["img"]` alone. Reading the cropped pixels assumes neither.
+    """
+    proc = make_proc()
+    proc._view_rgb = np.array([[[10, 20, 30], [40, 50, 60]]], np.uint8)
+    assert proc._view_rgb.reshape(-1, 3).tolist() == [[10, 20, 30], [40, 50, 60]]
+
+
+def test_a_colourful_frame_reports_chroma():
+    proc = make_proc()
+    proc._view_rgb = np.array([[[255, 0, 0], [0, 255, 0]]], np.uint8)
+    out = proc._colour_check()
+    assert out["grey"] is False
+    assert out["chroma"] == pytest.approx(255.0)
+    assert "lost it after this point" in out["note"]
+
+
+def test_a_grey_frame_says_so():
+    """The case the robot cannot see: every channel equal, at any brightness."""
+    proc = make_proc()
+    proc._view_rgb = np.dstack([np.full((4, 4), 200, np.uint8)] * 3)
+    out = proc._colour_check()
+    assert out["grey"] is True
+    assert out["chroma"] == 0.0
+    assert "the picture is" in out["note"]
+
+
+def test_no_colour_check_before_a_frame_has_been_seen():
+    assert make_proc()._colour_check() is None
