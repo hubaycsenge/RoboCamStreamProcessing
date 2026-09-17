@@ -189,6 +189,39 @@ def map_from_cloud_matrix(pose_c2w: np.ndarray, odom: Odom,
     return t_map_cam @ invert_rigid(pose_c2w)
 
 
+def floor_height(points_map: np.ndarray, bin_m: float = 0.05) -> Optional[float]:
+    """Where the cloud's biggest horizontal surface sits, in map z.
+
+    A correctly placed indoor cloud has its densest height bin at the floor,
+    which the map frame defines as z = 0. So this number **is** the placement
+    error in z, measured rather than inferred, and it stays meaningful when the
+    agreement does not: a cloud sunk two metres can still have walls that line
+    up in x and y, which is what makes the fault so easy to look straight past.
+
+    The mode, not the minimum or a percentile. A monocular reconstruction
+    scatters stray points well below any real surface, so the lowest point is
+    noise; the floor is wherever the most points are, because it is the largest
+    thing in the room and the model sees all of it at once.
+
+    None when there is nothing to measure. This diagnoses the placement, it
+    does not correct it -- what to do about a floor at -1.9 m depends on which
+    input was wrong, and guessing that here would be a second estimator.
+    """
+    points_map = np.asarray(points_map, dtype=np.float64).reshape(-1, 3)
+    if points_map.shape[0] < 10 or bin_m <= 0:
+        return None
+    z = points_map[:, 2]
+    z = z[np.isfinite(z)]
+    if z.size < 10:
+        return None
+    lo, hi = float(z.min()), float(z.max())
+    if not math.isfinite(lo) or not math.isfinite(hi) or hi - lo < bin_m:
+        return round(float(np.median(z)), 3)
+    counts, edges = np.histogram(z, bins=max(1, int((hi - lo) / bin_m)))
+    peak = int(np.argmax(counts))
+    return round(float((edges[peak] + edges[peak + 1]) / 2.0), 3)
+
+
 def _apply(matrix: np.ndarray, points: np.ndarray) -> np.ndarray:
     points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
     if points.size == 0:
@@ -438,6 +471,11 @@ def compare(
         "over_unknown": int((new & unknown_map).sum()),
         "missing": int(missing.sum()),
         "z_slice": [z_min, z_max],
+        # The placement error in z, in metres, for a cloud of a room with a
+        # floor in it. 0 is right; anything else is how far the whole cloud has
+        # sunk or risen, and is the number to compensate by once it is known
+        # which input put it there.
+        "floor_z": floor_height(points_map),
         **bin_stats,
     }
 

@@ -13,6 +13,7 @@ import math
 import numpy as np
 import pytest
 
+import robocam.compare as compare_mod
 from robocam.compare import (OPTICAL_TO_BODY, CameraMount, cloud_to_map, compare,
                              estimate_shift, occupancy_from_cloud)
 from robocam.occupancy import Grid
@@ -299,3 +300,35 @@ def test_a_camera_tilted_down_sees_the_floor_ahead_of_the_robot():
     along_the_lens = np.array([[0.0, 0.0, 0.2 * math.sqrt(2.0)]])
     out = cloud_to_map(along_the_lens, identity_pose(), odom, CameraMount())
     assert out[0] == pytest.approx([0.2, 0.0, 0.0], abs=1e-9)
+
+
+# -- where the cloud's floor ended up ----------------------------------------
+#
+# A cloud sunk two metres can still have walls that line up in x and y, so the
+# agreement stays plausible while a standing person reconstructs entirely under
+# the floor. This is the number that says so.
+
+def test_the_floor_of_a_placed_cloud_is_at_zero():
+    floor = np.zeros((400, 3))
+    floor[:, 0] = np.linspace(0, 4, 400)
+    assert compare_mod.floor_height(floor) == pytest.approx(0.0, abs=0.05)
+
+
+def test_a_sunk_cloud_reports_how_far_it_sank():
+    floor = np.zeros((400, 3))
+    floor[:, 0] = np.linspace(0, 4, 400)
+    floor[:, 2] = -1.87
+    assert compare_mod.floor_height(floor) == pytest.approx(-1.87, abs=0.05)
+
+
+def test_stray_points_below_the_floor_do_not_move_it():
+    """The mode, not the minimum: monocular depth scatters points under any surface."""
+    floor = np.zeros((400, 3))
+    floor[:, 0] = np.linspace(0, 4, 400)
+    strays = np.zeros((20, 3))
+    strays[:, 2] = np.linspace(-3.0, -0.5, 20)
+    assert compare_mod.floor_height(np.vstack([floor, strays])) == pytest.approx(0.0, abs=0.05)
+
+
+def test_too_little_cloud_to_measure_says_none():
+    assert compare_mod.floor_height(np.zeros((3, 3))) is None
