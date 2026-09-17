@@ -226,11 +226,29 @@ compare:
   # one is placed with that instead -- the result's data.compare.camera_from
   # says "robot". Once a session has sent one, a frame without it is not placed
   # at all. These values only matter for a robot that does not send it.
-  camera_x: 0.10
+  #
+  # MEASURED FROM THE URDF, 2026-09-17. mecanumbot_description's
+  # mecanumbot.urdf puts head_joint at (0.1063, 0, 0.1679) in base_link and
+  # camera_joint 0.022 forward / 0.038 up of it in the head, so the lens sits
+  # at (0.128, 0, 0.206) with the neck at its neutral 600 ticks. The previous
+  # 0.45 was 24 cm too high, and by this section's own warning above that put
+  # every reconstructed surface 24 cm low -- the floor at z = -0.24 m, and the
+  # cloud visibly under the map's ground plane in RViz. Change this and
+  # mecanumbot_deep3r's camera.pivot_*/lever_* together or not at all.
+  camera_x: 0.128
   camera_y: 0.0
-  camera_z: 0.45
+  camera_z: 0.206
   camera_roll: 0.0
-  camera_pitch: 0.0
+  # The neutral driving gaze looks slightly UP -- 4.7 deg, measured 2026-09-15;
+  # the same angle is NECK_PITCH_AT_LEVEL in mecanumbot_sensorproc_node and
+  # camera.pitch_at_level_deg in deep3r.yaml.
+  #
+  # NOTE THE SIGN, which is the opposite of the robot's. CameraMount.matrix()
+  # builds the REP-103 ZYX product, in which a POSITIVE pitch tips the lens
+  # DOWN; mecanumbot_deep3r's NeckCamera writes its pitch positive UP and
+  # rotates by -pitch to compensate. So "4.7 deg up" is -0.082 here and
+  # +4.7 there, and copying one into the other lands the cloud 9.4 deg out.
+  camera_pitch: -0.082
   camera_yaw: 0.0
 
   # --- the pose hint (the dotted arrow to SLAM) ---

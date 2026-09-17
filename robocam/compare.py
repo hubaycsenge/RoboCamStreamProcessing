@@ -81,12 +81,28 @@ class CameraMount:
     Mecanumbot's camera is on a neck motor — ``pitch`` in particular is whatever
     the neck is currently commanded to, and a stage that wants a moving neck can
     update it per frame instead of per session.
+
+    ``pitch`` follows REP-103, so a POSITIVE pitch tips the lens DOWN.
+    ``mecanumbot_deep3r``'s ``NeckCamera`` writes the same angle positive UP
+    and rotates by its negation; the two agree about the camera and disagree
+    about the word, so a value copied between them lands the cloud at twice
+    the tilt.
+
+    The defaults are the Mecanumbot's, read off ``mecanumbot_description``'s
+    ``mecanumbot.urdf``: head_joint at (0.1063, 0, 0.1679) in base_link plus
+    camera_joint 0.022 forward and 0.038 up of it.  ``z`` was 0.45 until
+    2026-09-17, which is 24 cm above where the lens actually is and sank every
+    unplaced cloud by that much.
     """
 
-    x: float = 0.10
+    x: float = 0.128
     y: float = 0.0
-    z: float = 0.45
+    z: float = 0.206
     roll: float = 0.0
+    # Left at zero, unlike x/z: the neck's tilt is per-session configuration
+    # (config/server.yaml's camera_pitch, -0.082 for the neutral gaze) and a
+    # class default that quietly tilted the lens would also tilt every
+    # axis-convention test that constructs a bare mount.
     pitch: float = 0.0
     yaw: float = 0.0
 

@@ -379,18 +379,81 @@ class FakeScan:
         self.summary = summary
 
 
+def _eye_pose(x=0.0, y=0.0, z=0.0):
+    """A camera at (x, y, z) in CUT3R's world, looking along world +z."""
+    pose = np.eye(4)
+    pose[:3, 3] = (x, y, z)
+    return pose
+
+
 def test_scale_check_compares_the_cloud_with_the_lidar():
     proc = make_proc(min_conf=1.0)
     f = frame(0)
     f.scan = FakeScan(front_min_m=2.0)
     pts = np.tile([0.0, 0.0, 2.0], (100, 1))
 
-    out = proc._scale_check(f, pts, np.full(100, 5.0))
+    out = proc._scale_check(f, pts, np.full(100, 5.0), _eye_pose())
 
     assert out["lidar_front_m"] == 2.0
     # CUT3R claims metric scale and nothing else in the pipeline would notice
     # if it were wrong by a factor of two; this is the cheapest check of it.
     assert out["ratio"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_scale_check_measures_from_the_lens_not_the_world_origin():
+    """The regression that made this number meaningless as soon as the robot moved.
+
+    CUT3R's world frame is anchored on the first frame of the session, so a
+    cloud 2 m in front of a camera that has driven 10 m sits ~12 m from that
+    origin.  Measuring from there reported a scale error of six, every frame,
+    for a reconstruction that was exactly right.
+    """
+    proc = make_proc(min_conf=1.0)
+    f = frame(0)
+    f.scan = FakeScan(front_min_m=2.0)
+    pts = np.tile([0.0, 0.0, 12.0], (100, 1))      # 2 m ahead of a lens at z=10
+
+    out = proc._scale_check(f, pts, np.full(100, 5.0), _eye_pose(z=10.0))
+
+    assert out["cloud_near_m"] == pytest.approx(2.0, abs=0.01)
+    assert out["ratio"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_scale_check_ignores_the_floor_under_the_lens():
+    """The scanner ranges an arc; the cloud fills a frustum, floor included.
+
+    The nearest 5% of any indoor cloud is floor a handful of centimetres under
+    the camera, which is genuinely that close and is not what front_min_m
+    measured.  Restricting to the scanner's own arc is what makes the two
+    numbers comparable.
+    """
+    proc = make_proc(min_conf=1.0)
+    f = frame(0)
+    f.scan = FakeScan(front_min_m=2.0)
+    # 200 floor points 0.2 m below the lens and just ahead of it, plus a wall
+    # 2 m down the optical axis.
+    floor = np.tile([0.0, 0.2, 0.15], (200, 1))
+    wall = np.tile([0.0, 0.0, 2.0], (50, 1))
+    pts = np.vstack([floor, wall])
+
+    out = proc._scale_check(f, pts, np.full(len(pts), 5.0), _eye_pose())
+
+    assert out["arc_deg"] == 60.0
+    assert out["points"] == 50                     # the floor is outside the arc
+    assert out["ratio"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_scale_check_says_so_when_the_camera_is_not_looking_where_the_scanner_is():
+    """A neck turned away is not a scale measurement, and must not report as one."""
+    proc = make_proc(min_conf=1.0)
+    f = frame(0)
+    f.scan = FakeScan(front_min_m=2.0)
+    pts = np.tile([0.0, 0.0, -3.0], (20, 1))       # entirely behind the lens
+
+    out = proc._scale_check(f, pts, np.full(20, 5.0), _eye_pose())
+
+    assert out["arc_deg"] is None
+    assert "not a scale check" in out["note"]
 
 
 def test_scale_check_falls_back_to_the_nearest_return():
@@ -400,7 +463,7 @@ def test_scale_check_falls_back_to_the_nearest_return():
     f.scan = FakeScan(front_min_m=None, nearest_m=4.0)
     pts = np.tile([0.0, 0.0, 2.0], (10, 1))
 
-    out = proc._scale_check(f, pts, np.full(10, 5.0))
+    out = proc._scale_check(f, pts, np.full(10, 5.0), _eye_pose())
 
     assert out["lidar_front_m"] == 4.0
     assert out["ratio"] == pytest.approx(0.5, abs=0.01)
@@ -408,14 +471,14 @@ def test_scale_check_falls_back_to_the_nearest_return():
 
 def test_scale_check_is_absent_without_a_scan():
     proc = make_proc()
-    assert proc._scale_check(frame(0), np.zeros((3, 3)), np.ones(3)) is None
+    assert proc._scale_check(frame(0), np.zeros((3, 3)), np.ones(3), _eye_pose()) is None
 
 
 def test_scale_check_is_absent_when_the_scan_saw_nothing():
     proc = make_proc()
     f = frame(0)
     f.scan = FakeScan(front_min_m=None, nearest_m=None)
-    assert proc._scale_check(f, np.zeros((3, 3)), np.ones(3)) is None
+    assert proc._scale_check(f, np.zeros((3, 3)), np.ones(3), _eye_pose()) is None
 
 
 # -- the comparison against the robot's map ----------------------------------

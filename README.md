@@ -740,8 +740,13 @@ one that frame is about to be folded into, and clearing it from another thread
 mid-inference is the kind of race that leaves a reconstruction nothing looks
 wrong with.
 
-To resume a run across a robot restart, pass the previous id:
-`ros2 launch mecanumbot_deep3r deep3r.launch.py` with `run_id:=<the old one>`.
+To resume a run across a robot restart, pass the previous id. The client logs
+it at startup (`run <id> -- the server clears ...`). T1 starts the client from
+its own launch file, so the argument goes there:
+`ros2 launch mecanumbot_autoslam launch_t1.launch.py run_id:=<the old one>`
+(or `launch_autoslam.launch.py`, or `mecanumbot_deep3r deep3r.launch.py` for the
+client on its own). Before 2026-09-15 no launch file declared `run_id`, so passing
+it did nothing and every relaunch wiped the scan.
 
 ### State is the map
 

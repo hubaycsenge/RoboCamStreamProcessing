@@ -578,7 +578,7 @@ class Deep3RProcessor(Processor):
             "encode_ms": round(encode_ms, 1),
         }
         if self.lidar_check:
-            data["scale_check"] = self._scale_check(frame, pts, conf)
+            data["scale_check"] = self._scale_check(frame, pts, conf, pose_c2w)
         if self.compare_map:
             data["compare"] = self._compare_with_map(frame, kept_pts, pose_c2w)
         if self.seek:
@@ -1261,15 +1261,32 @@ class Deep3RProcessor(Processor):
 
     # -- sanity --------------------------------------------------------------
 
-    def _scale_check(self, frame: Frame, pts, conf) -> Optional[Dict[str, Any]]:
+    def _scale_check(self, frame: Frame, pts, conf, pose_c2w) -> Optional[Dict[str, Any]]:
         """Compare the cloud's forward depth with the LiDAR's forward range.
 
         CUT3R predicts metric scale, which is the property this whole approach
         rests on, and nothing else in the pipeline would notice if it were
         wrong by a factor of two.  The scan is already attached to the frame
-        and already reduced, so this costs one median.
+        and already reduced, so this costs one percentile.
+
+        Two things this got wrong until 2026-09-17, both of which made the
+        ratio a number that looked like a measurement and was not:
+
+        **``pts`` are in CUT3R's world frame, not the camera's.**  That frame
+        is anchored on the *first* frame of the session, so the distance from
+        its origin is how far the cloud is from where the robot started.  It
+        was right on frame one and drifted with every metre driven after it.
+        The camera centre is ``pose_c2w[:3, 3]``, and subtracting it is what
+        the old comment already said the code was doing.
+
+        **The LiDAR ranges an arc, and the cloud fills a frustum.**  The
+        nearest 5% of a cloud measured from the lens is floor, about 20 cm
+        below it and genuinely that close, while ``front_min_m`` is a wall
+        several metres away.  Comparing them reported CUT3R as wrong by an
+        order of magnitude whatever it did.  So the cloud is restricted to the
+        same arc the scan summary used, about the camera's own optical axis.
         """
-        if frame.scan is None:
+        if frame.scan is None or pose_c2w is None:
             return None
         summary = dict(frame.scan.summary)
         # front_min_m is None whenever nothing returned inside the front arc,
@@ -1282,14 +1299,45 @@ class Deep3RProcessor(Processor):
         good = conf >= self.min_conf
         if not good.any():
             return None
-        # Camera looks down +z in CUT3R's camera frame; after the pose the
-        # points are in world, so use distance from the camera centre instead
-        # of a single axis, which is orientation-independent.
-        depth = np.linalg.norm(pts[good], axis=1)
-        cam_min = float(np.percentile(depth, 5))
+
+        pose_c2w = np.asarray(pose_c2w, dtype=np.float64).reshape(4, 4)
+        # Vectors from the lens, not from the world origin.
+        rel = np.asarray(pts, dtype=np.float64)[good] - pose_c2w[:3, 3]
+        dist = np.linalg.norm(rel, axis=1)
+        usable = dist > 1e-6
+        if not usable.any():
+            return None
+        rel, dist = rel[usable], dist[usable]
+
+        # The same arc the summary's front_min_m came from, about the optical
+        # axis (CUT3R's camera looks along +z, as OpenCV does).  front_deg is
+        # taken from the summary rather than restated here: a second copy of
+        # the constant is how the two ends of a comparison drift apart.
+        arc_deg = float(summary.get("front_deg") or 60.0)
+        forward = pose_c2w[:3, 2]
+        norm = float(np.linalg.norm(forward))
+        in_arc = None
+        if norm > 1e-9:
+            cos_limit = math.cos(math.radians(arc_deg) / 2.0)
+            in_arc = (rel @ (forward / norm)) / dist >= cos_limit
+
+        if in_arc is not None and in_arc.any():
+            selected, arc_used = dist[in_arc], arc_deg
+        else:
+            # Nothing in the arc: the head is turned far enough that the camera
+            # and the scanner are not looking at the same thing.  Report on the
+            # whole cloud and say so, rather than inventing a ratio.
+            selected, arc_used = dist, None
+
+        cam_min = float(np.percentile(selected, 5))
         return {
             "lidar_front_m": round(float(front), 3),
             "cloud_near_m": round(cam_min, 3),
             "ratio": round(cam_min / front, 3) if front > 0 else None,
-            "note": "ratio near 1.0 means CUT3R's metric scale agrees with the LiDAR",
+            "arc_deg": arc_used,
+            "points": int(selected.size),
+            "note": ("ratio near 1.0 means CUT3R's metric scale agrees with the LiDAR"
+                     if arc_used is not None else
+                     "no cloud inside the scanner's front arc; ratio is over the "
+                     "whole frustum and is not a scale check"),
         }

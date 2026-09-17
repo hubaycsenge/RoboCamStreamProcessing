@@ -274,6 +274,10 @@ def analyse(
     out["nearest_deg"] = round(math.degrees(float(vb[nearest])), 1)
 
     half_front = math.radians(front_deg) / 2.0
+    # Recorded, not just used: deep3r's scale_check restricts the cloud to this
+    # same arc, and a second copy of the width in that file is how the two ends
+    # of the comparison would drift apart.
+    out["front_deg"] = round(float(front_deg), 1)
     front = np.abs(vb) <= half_front
     if front.any():
         front_min = float(np.min(vr[front]))
